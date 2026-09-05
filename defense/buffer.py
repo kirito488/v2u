@@ -14,23 +14,26 @@ for dump backfill only.
 
 Each watch has a KF. Unmatched + ray-visible → ATTACK (label only; do not
 emit into Ŷ — Tentative is still uncertain). Pool ATTACK still coasts.
+
+Visibility `v` defaults to box-ray occluders; pass `visibility_fn(box)->float`
+(e.g. LiDAR polar depth from ego) to override.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numpy as np
 
 from .associate import THETA_DIST, THETA_IOU, hungarian_match_pool, same_object
-from .gating import CERTAIN, Q_L, TENTATIVE, detection_quality
+from .gating import CERTAIN, Q_L, TENTATIVE, detection_quality, traj_ref_box
 from .geometry import iou_bev
 from .kf import birth_state, kf_predict, kf_update
 from .occlusion import K_ATK, V_MIN, visibility_ratio
 
 P_MIN = 0.15
 THETA_SOFT = 0.05  # buffer-only Ego band; gating/pool still use score_thres
-THETA_CONFIRM = 0.9
+THETA_CONFIRM = 0.7
 THETA_REJECT = 0.1
 T_TIMEOUT = 10
 KAPPA_POS = 1.4
@@ -164,8 +167,14 @@ def _stack_boxes(items) -> tuple:
     return np.stack(rows), idx
 
 
-def match_gt_tag(box, gt_boxes, gt_ids, iou_thres: float = THETA_IOU) -> str:
-    """'hit id=… iou=…' or 'miss' (nearest GT) for buffer confirm/reject lines."""
+def match_gt_tag(
+    box,
+    gt_boxes,
+    gt_ids,
+    iou_thres: float = THETA_IOU,
+    dist_thres: float = THETA_DIST,
+) -> str:
+    """'hit id=…' if IoU≥θ_iou OR dxy≤θ_d; else 'miss' (nearest GT)."""
     gts = np.asarray(gt_boxes) if gt_boxes is not None else np.zeros((0, 7))
     if box is None or gts.ndim != 2 or gts.shape[0] == 0:
         return ""
@@ -179,7 +188,7 @@ def match_gt_tag(box, gt_boxes, gt_ids, iou_thres: float = THETA_IOU) -> str:
     dist = float(dxy[use])
     ids = list(gt_ids or [])
     gid = ids[use] if use < len(ids) else use
-    if iou >= float(iou_thres):
+    if iou >= float(iou_thres) or dist <= float(dist_thres):
         return "  hit id={} iou={:.2f} dxy={:.1f}m".format(gid, iou, dist)
     return "  miss id={} iou={:.2f} dxy={:.1f}m".format(gid, iou, dist)
 
@@ -190,6 +199,7 @@ class SoftEgoDet:
 
     box: np.ndarray
     q: float
+    p: float = 0.0
 
 
 @dataclass
@@ -206,6 +216,9 @@ class BufferEntry:
     e_temp: float = 0.0
     gt_tag: str = ""  # filled on confirm/reject/timeout
     hist: list = field(default_factory=list)  # (frame_id, box) while watching
+    # Measurement traj for KF birth velocity: ego preferred, else fuse (init).
+    # (frame_id, box); miss / pure-UAV frames omitted unless no ego/fuse ever seen.
+    traj: list = field(default_factory=list)
     x: Optional[np.ndarray] = None
     P: Optional[np.ndarray] = None
     v: float = 1.0
@@ -213,7 +226,42 @@ class BufferEntry:
 
     def ensure_kf(self) -> None:
         if self.x is None or self.P is None:
-            self.x, self.P = birth_state(self.box)
+            self.x, self.P = birth_state(self.box, traj=self.velocity_traj())
+
+    def append_traj(self, frame_id: int, box, source: str = "") -> None:
+        """Record traj point: (frame_id, box, source_tag)."""
+        if box is None:
+            return
+        self.traj.append(
+            (int(frame_id), np.asarray(box, dtype=np.float64)[:7].copy(), str(source or ""))
+        )
+
+    def velocity_traj(self) -> list:
+        """Points for KF birth velocity: ego/fuse preferred; else uav/box/hist.
+
+        Returns list of (frame_id, box).
+        """
+        rows = list(self.traj or [])
+        pref = []
+        for item in rows:
+            if len(item) >= 3:
+                fid, b, src = item[0], item[1], str(item[2])
+            elif len(item) == 2:
+                fid, b, src = item[0], item[1], ""
+            else:
+                continue
+            if src in ("ego", "fuse"):
+                pref.append((int(fid), b))
+        if len(pref) >= 2:
+            return pref
+        # Fall back: any traj tag, then hist (may include KF coast).
+        any_t = []
+        for item in rows:
+            if len(item) >= 2:
+                any_t.append((int(item[0]), item[1]))
+        if len(any_t) >= 2:
+            return any_t
+        return [(int(fid), b) for fid, b in (self.hist or [])]
 
     def snapshot(self) -> "BufferEntry":
         """Immutable copy for per-frame dump (entries are mutated across frames)."""
@@ -237,15 +285,20 @@ class BufferEntry:
         b = np.asarray(self.box)
         src = "amb" if self.from_ambiguous else "direct"
         return (
-            "  #{:<2d}  {:<8s}  P={:.3f}  age={:<2d}  from={:<6s}  "
-            "e={:+.2f}  v={:.2f}  Duav0={}  "
+            "  #{:<2d}  {:<8s}  P={:.3f}  Q_ego={:.3f}  Q_uav={:.3f}  "
+            "age={:<2d}  miss={:<2d}  from={:<6s}  "
+            "e={:+.2f}  e_temp={:+.2f}  V={:.3f}  Duav0={}  "
             "B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]{}".format(
                 k,
                 self.decision,
                 self.p,
+                self.q_ego,
+                self.q_uav,
                 self.age,
+                self.miss_age,
                 src,
                 self.evidence,
+                self.e_temp,
                 self.v,
                 int(self.d_uav0),
                 b[0],
@@ -362,8 +415,12 @@ class TentativeBuffer:
         self.prev_output = np.zeros((0, 7), dtype=np.float64)
         self.confirmed_hists: list = []
         self.gate_certain_hists: list = []
+        self.last_certain_trajs: list = []
+        self.last_confirm_trajs: list = []
 
-    def _init_from_obj(self, obj, frame_id: int = 0) -> BufferEntry:
+    def _init_from_obj(
+        self, obj, frame_id: int = 0, ego=None, uav=None, init=None
+    ) -> BufferEntry:
         st = strength(source_q(obj), q_ref=self.q_l, p_min=self.p_min)
         q_ego = obj_q_ego(obj)
         q_collab = obj_q_collab(obj)
@@ -374,8 +431,14 @@ class TentativeBuffer:
             p0 = max(half * st * gamma, self.p_min)
         else:
             p0 = max(half * g_uav(q_collab, q_ego) * st, self.p_min)
-        b = np.asarray(obj.box, dtype=np.float64)[:7].copy()
-        x, P = birth_state(b)
+        ref, src = traj_ref_box(obj, ego=ego, uav=uav, init=init)
+        b = (
+            np.asarray(ref, dtype=np.float64)[:7].copy()
+            if ref is not None
+            else np.asarray(obj.box, dtype=np.float64)[:7].copy()
+        )
+        traj = [(int(frame_id), b.copy(), src or "box")]
+        x, P = birth_state(b, traj=[(int(frame_id), b.copy())])
         return BufferEntry(
             box=b,
             p=_clip01(p0),
@@ -386,6 +449,7 @@ class TentativeBuffer:
             q_uav=obj_q_uav(obj),
             decision=WATCH,
             hist=[(int(frame_id), b.copy())],
+            traj=traj,
             x=x,
             P=P,
         )
@@ -444,6 +508,10 @@ class TentativeBuffer:
         occluders=None,
         pool_boxes=None,
         soft_ego=None,
+        visibility_fn: Optional[Callable[[np.ndarray], float]] = None,
+        ego=None,
+        uav=None,
+        init=None,
     ) -> FrameBuffer:
         """Consume this-frame leftover gating; return snapshot.
 
@@ -452,6 +520,12 @@ class TentativeBuffer:
         Unmatched watches may still match `soft_ego` (P in [θ_soft, score_thres))
         for a positive Ego update. Unmatched + ray-visible → ATTACK label only.
         Watches that match a living pool track exit silently (pool owns them).
+
+        `visibility_fn`, when set, replaces box-occluder `visibility_ratio`
+        (intended for ego LiDAR polar-depth occlusion).
+
+        `ego` / `uav` / `init` SourceResults select traj boxes (ego > fuse > uav)
+        for KF birth-velocity history.
         """
         objects = list(getattr(gating, "objects", None) or [])
         match_src = list(match_objects) if match_objects is not None else objects
@@ -490,13 +564,20 @@ class TentativeBuffer:
         confirmed: List[np.ndarray] = []
         confirms: List[BufferEntry] = []
         n_c = n_r = n_t = n_a = 0
+        # Trajectories of watches that just became gate/pool Certain (for pool KF).
+        self.last_certain_trajs: list = []
+        self.last_confirm_trajs: list = []
 
         def finish(entry: BufferEntry, decision: str) -> None:
             nonlocal n_c, n_r, n_t, n_a
             entry.decision = decision
             if decision in (CONFIRM, REJECT, TIMEOUT, ATTACK):
                 entry.gt_tag = match_gt_tag(
-                    entry.box, gt_boxes, gt_ids, iou_thres=self.theta_iou
+                    entry.box,
+                    gt_boxes,
+                    gt_ids,
+                    iou_thres=self.theta_iou,
+                    dist_thres=self.theta_d,
                 )
             else:
                 entry.gt_tag = ""
@@ -515,6 +596,13 @@ class TentativeBuffer:
                 confirms.append(entry)
                 if getattr(entry, "hist", None):
                     self.confirmed_hists.append(list(entry.hist))
+                self.last_confirm_trajs.append(
+                    {
+                        "box": np.asarray(entry.box, dtype=np.float64)[:7].copy(),
+                        "traj": list(entry.velocity_traj()),
+                        "hist": list(entry.hist or []),
+                    }
+                )
             elif decision == REJECT:
                 n_r += 1
             else:
@@ -525,13 +613,30 @@ class TentativeBuffer:
             pool = np.zeros((0, 7), dtype=np.float64)
         occ = occluders
 
+        def _vis(box) -> float:
+            b = np.asarray(box, dtype=np.float64).reshape(-1)[:7]
+            if visibility_fn is not None:
+                try:
+                    return float(visibility_fn(b))
+                except Exception:
+                    return 0.0
+            return float(visibility_ratio(b, occ))
+
+        def _meas_traj(entry: BufferEntry, obj, frame_id: int, fallback_box) -> np.ndarray:
+            ref, src = traj_ref_box(obj, ego=ego, uav=uav, init=init)
+            if ref is None:
+                ref = np.asarray(fallback_box, dtype=np.float64)[:7]
+                src = "box"
+            entry.append_traj(frame_id, ref, src)
+            return np.asarray(ref, dtype=np.float64)[:7].copy()
+
         for ei, entry in enumerate(old):
             oj = matched.get(ei, -1)
             if oj >= 0:
                 obj = match_src[oj]
                 if getattr(obj, "from_far", False):
                     continue
-                curr = np.asarray(obj.box, dtype=np.float64).copy()
+                curr = _meas_traj(entry, obj, frame_id, obj.box)
                 if int(obj.d_ego) == 1:
                     entry.q_ego = obj_q_ego(obj)
                 if int(obj.d_uav) == 1:
@@ -540,8 +645,15 @@ class TentativeBuffer:
                     # Gate/pool Certain: leave buffer; dump backfill only.
                     entry.hist.append((int(frame_id), curr[:7].copy()))
                     self.gate_certain_hists.append(list(entry.hist))
+                    self.last_certain_trajs.append(
+                        {
+                            "box": curr[:7].copy(),
+                            "traj": list(entry.velocity_traj()),
+                            "hist": list(entry.hist),
+                        }
+                    )
                     continue
-                entry.v = visibility_ratio(entry.box, occ)
+                entry.v = _vis(entry.box)
                 ego_hit = int(obj.d_ego) == 1
                 self._update(
                     entry,
@@ -567,7 +679,8 @@ class TentativeBuffer:
                 det = soft_src[sj]
                 curr = np.asarray(det.box, dtype=np.float64).copy()
                 entry.q_ego = float(getattr(det, "q", 0.0) or 0.0)
-                entry.v = visibility_ratio(entry.box, occ)
+                entry.append_traj(frame_id, curr, "ego")
+                entry.v = _vis(entry.box)
                 self._update(
                     entry,
                     ego_hit=True,
@@ -579,7 +692,7 @@ class TentativeBuffer:
                 entry.miss_age = 0
                 finish(entry, self._decide(entry))
                 continue
-            entry.v = visibility_ratio(entry.box, occ)
+            entry.v = _vis(entry.box)
             entry.miss_age = int(entry.miss_age) + 1
             self._update(
                 entry,
@@ -603,7 +716,9 @@ class TentativeBuffer:
         for obj in objects:
             if id(obj) in used_ids or obj.state != TENTATIVE or obj.box is None:
                 continue
-            entry = self._init_from_obj(obj, frame_id=frame_id)
+            entry = self._init_from_obj(
+                obj, frame_id=frame_id, ego=ego, uav=uav, init=init
+            )
             finish(entry, self._decide(entry))
 
         self.entries = keep

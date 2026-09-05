@@ -668,6 +668,17 @@ def main():
         "  early_remove_mode =", args.early_remove_mode,
         "  defense =", args.defense,
     )
+    if args.verbose:
+        from defense.occlusion import V_MIN, K_ATK
+        from defense.buffer import THETA_CONFIRM, THETA_REJECT, THETA_SOFT
+        from defense.trust_pool import POOL_K
+        print(
+            "[params -v] V_min={}  K_atk={}  θ_confirm={}  θ_reject={}  "
+            "θ_soft={}  POOL_K={}  quiet={}".format(
+                V_MIN, K_ATK, THETA_CONFIRM, THETA_REJECT, THETA_SOFT, POOL_K, quiet,
+            ),
+            flush=True,
+        )
     ckpt_dir = args.ckpt_dir or default_ckpt_dir(args.save)
     if ckpt_dir:
         print(
@@ -804,13 +815,35 @@ def main():
                         )
                     )
                 print("  [gt-ego Car+range]")
-                for line in dump_boxes(ge, ge_ids):
+                soft_lo = 0.05
+                soft_hi = float(args.score_thres) if args.score_thres is not None else 0.3
+                from defense.three_source import soft_ego_gt_extras
+
+                ge_extra = soft_ego_gt_extras(
+                    ge,
+                    ge_ids,
+                    ego_raw=getattr(fr, "ego_raw", None),
+                    p_lo=soft_lo,
+                    p_hi=soft_hi,
+                    iou_thres=float(args.iou_thres),
+                    ego_depth=getattr(fr, "ego_depth", None),
+                )
+                for line in dump_boxes(ge, ge_ids, extras=ge_extra):
                     print(line)
                 print("  [gt-uav Car+range]")
                 for line in dump_boxes(gu, gu_ids):
                     print(line)
                 print("  [gt-eval Car+range]")
-                for line in dump_boxes(dump_eval, dump_eval_ids):
+                ev_extra = soft_ego_gt_extras(
+                    dump_eval,
+                    dump_eval_ids,
+                    ego_raw=getattr(fr, "ego_raw", None),
+                    p_lo=soft_lo,
+                    p_hi=soft_hi,
+                    iou_thres=float(args.iou_thres),
+                    ego_depth=getattr(fr, "ego_depth", None),
+                )
+                for line in dump_boxes(dump_eval, dump_eval_ids, extras=ev_extra):
                     print(line)
                 gate_maps = (
                     fr.gating.source_state_maps()
@@ -833,6 +866,7 @@ def main():
                             gtb,
                             gtid,
                             iou_thres=args.iou_thres,
+                            dist_thres=4.0,
                             gate_states=states,
                         )
                     )

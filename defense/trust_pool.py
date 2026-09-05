@@ -23,14 +23,14 @@ from .gating import (
     THETA_P,
     box_matches_gt_id,
 )
-from .kf import birth_state, kf_predict, kf_update
+from .kf import birth_state, kf_predict, kf_update, velocity_from_traj
 from .occlusion import K_ATK, V_MIN, visibility_ratio
 
 # Max frames a track may coast without a match when occluded.
 POOL_K = 3
 
-UPDATE = "update"  # Certain Ego → KF update
-HOLD = "hold"      # Ego/Fusion match, no KF update
+UPDATE = "update"  # Certain Ego → KF update (shrinks P)
+HOLD = "hold"      # UAV/Init/(weak Ego): snap box xy, keep post-predict P growing
 MISS = "miss"
 DROP = "drop"
 BIRTH = "birth"
@@ -117,7 +117,7 @@ class PoolRecord:
     def dump_line(self, k: int) -> str:
         b = self.box if self.box is not None else np.zeros(7)
         return (
-            "  #{:<2d}  {:<8s}  tid={:<3d}  IoU={:.2f}  v={:.2f}  θ_iou={:.2f}  "
+            "  #{:<2d}  {:<8s}  tid={:<3d}  IoU={:.2f}  V={:.3f}  θ_iou={:.2f}  "
             "θ_d={:.1f}m  age={}/{}  idx=(e{} u{} i{})  "
             "B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]{}".format(
                 k,
@@ -291,9 +291,11 @@ class TrustPool:
             return np.zeros((0, 7), dtype=np.float64)
         return np.stack(rows)
 
-    def _birth_track(self, box: np.ndarray, c_ego: float = 0.0) -> TrustTrack:
+    def _birth_track(
+        self, box: np.ndarray, c_ego: float = 0.0, traj=None
+    ) -> TrustTrack:
         b = _as_box(box)
-        x, P = birth_state(b)
+        x, P = birth_state(b, traj=traj)
         t = TrustTrack(
             tid=self._next_id,
             x=x,
@@ -308,13 +310,81 @@ class TrustPool:
         self.tracks.append(t)
         return t
 
+    def _find_traj_hint(self, box, hints) -> Optional[list]:
+        """Match box to a watch traj hint: list of {box, traj, hist}."""
+        if not hints:
+            return None
+        b = _as_box(box)
+        best = None
+        best_iou = -1.0
+        for h in hints:
+            hb = h.get("box") if isinstance(h, dict) else None
+            if hb is None:
+                continue
+            if not same_object(b, hb, self.theta_iou, self.theta_d):
+                continue
+            try:
+                from .geometry import iou_bev
+
+                iou = float(iou_bev(b, hb))
+            except Exception:
+                iou = 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best = h
+        if best is None:
+            return None
+        traj = best.get("traj") or best.get("hist") or []
+        return list(traj) if traj else None
+
+    def seed_velocity_from_trajs(self, hints) -> int:
+        """Set vx,vy on matched living tracks from backfill traj (first Certain).
+
+        Only overwrites velocity when |v| is still near zero (fresh birth) so a
+        later Certain-Ego update history is not clobbered.
+        """
+        if not hints:
+            return 0
+        n = 0
+        for t in self.tracks:
+            if t.box is None:
+                continue
+            traj = self._find_traj_hint(t.box, hints)
+            if not traj or len(traj) < 2:
+                continue
+            speed = float(np.hypot(float(t.x[2]), float(t.x[3])))
+            if speed > 0.05:
+                continue
+            vx, vy = velocity_from_traj(traj)
+            if abs(vx) < 1e-9 and abs(vy) < 1e-9:
+                continue
+            t.x[2] = float(vx)
+            t.x[3] = float(vy)
+            n += 1
+        return n
+
     def _apply_meas(self, t: TrustTrack, box: np.ndarray) -> None:
+        """Certain-Ego: full KF update (mean + shrink P)."""
         b = _as_box(box)
         t.x, t.P = kf_update(t.x, t.P, np.array([b[0], b[1]], dtype=np.float64))
         t.box = b.copy()
         t.box[0] = float(t.x[0])
         t.box[1] = float(t.x[1])
         t.updated = True
+        t.age = 0
+
+    def _hold_snap(self, t: TrustTrack, box: np.ndarray) -> None:
+        """Snap track box/xy to UAV|Init|weak-Ego; leave P inflated (no kf_update).
+
+        Next Certain-Ego update then trusts Ego strongly (large prior P → big K).
+        """
+        b = _as_box(box)
+        t.x[0] = float(b[0])
+        t.x[1] = float(b[1])
+        t.box = b.copy()
+        t.box[0] = float(t.x[0])
+        t.box[1] = float(t.x[1])
+        t.updated = False
         t.age = 0
 
     def _label(self, src_name: str, i: int, tag: str = DUMP_POOL) -> None:
@@ -397,7 +467,13 @@ class TrustPool:
             v=float(getattr(t, "v", 1.0)),
         )
         if t.box is not None:
-            rec.gt_tag = match_gt_tag(t.box, gt_boxes, gt_ids, iou_thres=self.theta_iou)
+            rec.gt_tag = match_gt_tag(
+                t.box,
+                gt_boxes,
+                gt_ids,
+                iou_thres=self.theta_iou,
+                dist_thres=self.theta_d,
+            )
         return rec
 
     def _match_dets(self, pred_boxes, boxes, src_idx, used: Set[int]):
@@ -444,15 +520,20 @@ class TrustPool:
         gt_lists=None,
         occluders=None,
         uav_sight=None,
+        birth_traj_hints=None,
     ) -> FramePool:
         """Predict → Certain-Ego update / birth → other Ego/Fusion hold.
 
         Unmatched → ATTACK iff the object is "seeable but not detected".
         By default seeable = ego-ray visibility v >= v_min (ego origin).
         If uav_sight(box, occluders) is given, that callback decides (caller
-        ORs UAV line-of-sight from the UAV origin with UAV point density, so an
+        ORs UAV LiDAR polar-depth LOS with UAV point density, so an
         ego miss caused by ego occlusion no longer forces MISS and a pure
-        point-erasing attack still counts as ATTACK). Otherwise → miss/drop.
+        point-erasing attack still counts as ATTACK when depth/C remain). Otherwise → miss/drop.
+
+        `birth_traj_hints`: optional list of {box, traj, hist} from buffer watches
+        so a first Certain birth can seed (vx, vy) from the tentative backfill
+        trajectory (ego > fuse points).
         """
         lists = gt_lists or ((gt_boxes, gt_ids),)
         snap = FramePool(
@@ -466,6 +547,7 @@ class TrustPool:
         records = snap.records
         outputs: List[np.ndarray] = []
         n_update = n_hold = n_drop = n_birth = n_attack = 0
+        hints = list(birth_traj_hints or [])
 
         keep: List[TrustTrack] = []
         for t in self.tracks:
@@ -549,14 +631,15 @@ class TrustPool:
         for ei, box, c_ego in certain_obj:
             if ei in used_certain_set:
                 continue
-            t = self._birth_track(box, c_ego=c_ego)
+            traj = self._find_traj_hint(box, hints)
+            t = self._birth_track(box, c_ego=c_ego, traj=traj)
             t.ego_i = int(ei)
             n_birth += 1
             snap.used_ego.add(int(ei))
             outputs.append(t.box.copy())
             records.append(self._record(t, gt_boxes, gt_ids))
 
-        # Other-state Ego / Fusion: keep track, no KF update.
+        # Other-state Ego / Fusion: snap xy to det, keep P growing (no kf_update).
         rest = [i for i in range(len(self.tracks)) if i not in claimed_t and self.tracks[i].action != BIRTH]
         if rest:
             rest_pred = np.stack([self.tracks[i].pred_box() for i in rest])
@@ -599,8 +682,15 @@ class TrustPool:
                         t.iou = u_iou
                 hit = eh is not None or ih is not None or uh is not None
                 if hit:
+                    # Prefer Ego (weak/other) > Init > UAV for the snapped box.
+                    if eh is not None:
+                        meas = np.asarray(ego.boxes[int(t.ego_i)], dtype=np.float64)
+                    elif ih is not None:
+                        meas = np.asarray(init.boxes[int(t.init_i)], dtype=np.float64)
+                    else:
+                        meas = np.asarray(uav.boxes[int(t.uav_i)], dtype=np.float64)
+                    self._hold_snap(t, meas)
                     t.action = HOLD
-                    t.age = 0
                     n_hold += 1
                     outputs.append(t.box.copy())
                 else:
@@ -657,8 +747,12 @@ class TrustPool:
         boxes,
         c_egos: Optional[Sequence[float]] = None,
         allow_update: Optional[Sequence[bool]] = None,
+        trajs: Optional[Sequence] = None,
     ) -> int:
-        """Buffer-confirm boxes: birth if new. Never KF-update (only Certain does)."""
+        """Buffer-confirm boxes: birth if new. Never KF-update (only Certain does).
+
+        `trajs[j]` optional watch trajectory for seeding (vx, vy) at birth.
+        """
         del allow_update  # Certain-only update is handled in step()
         new = _as_boxes(boxes)
         if new.shape[0] == 0:
@@ -666,6 +760,9 @@ class TrustPool:
         cs = list(c_egos) if c_egos is not None else [0.0] * int(new.shape[0])
         while len(cs) < int(new.shape[0]):
             cs.append(0.0)
+        tr_list = list(trajs) if trajs is not None else [None] * int(new.shape[0])
+        while len(tr_list) < int(new.shape[0]):
+            tr_list.append(None)
         n_birth = 0
         used_new: Set[int] = set()
         if self.tracks:
@@ -677,7 +774,7 @@ class TrustPool:
         for j in range(int(new.shape[0])):
             if j in used_new:
                 continue
-            t = self._birth_track(new[j], c_ego=float(cs[j]))
+            t = self._birth_track(new[j], c_ego=float(cs[j]), traj=tr_list[j])
             n_birth += 1
             if self._last_snap is not None:
                 self._last_snap.records.append(

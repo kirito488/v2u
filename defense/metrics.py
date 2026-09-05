@@ -406,15 +406,25 @@ def frame_accepted_boxes(fr) -> np.ndarray:
     return np.stack(keep) if keep else np.zeros((0, 7), dtype=np.float64)
 
 
-def target_matched(boxes, target, iou_thres: float = 0.3) -> bool:
-    """True if any box BEV-IoU-matches the attack target."""
+def target_matched(
+    boxes,
+    target,
+    iou_thres: float = 0.3,
+    dist_thres: float = 4.0,
+) -> bool:
+    """True if any box matches target by BEV IoU≥θ_iou OR center dxy≤θ_d."""
     if target is None:
         return False
     boxes = _as_boxes7(boxes)
     t = np.asarray(target, dtype=np.float64).reshape(-1)[:7]
     if boxes.shape[0] == 0:
         return False
-    return any(float(iou_bev(b, t)) >= float(iou_thres) for b in boxes)
+    for b in boxes:
+        if float(iou_bev(b, t)) >= float(iou_thres):
+            return True
+        if float(np.hypot(b[0] - t[0], b[1] - t[1])) <= float(dist_thres):
+            return True
+    return False
 
 
 def evaluate_boxes_list(
@@ -489,12 +499,15 @@ def evaluate_attack_miss(
     frames,
     mode: str,
     iou_thres: float = 0.3,
+    dist_thres: float = 4.0,
 ) -> dict:
     """Count attack frames / instances where the attack was *not* identified.
 
     With-defense always uses accepted-state boxes
     (certain / pool / attack / am→certain / tentative→certain; includes pool coast).
     No-defense always uses Init.
+
+    Match = BEV IoU≥θ_iou OR center dxy≤θ_d.
 
     Spoof / multi_spoof:
       miss = any ghost still present in predictions (treated as real).
@@ -507,6 +520,7 @@ def evaluate_attack_miss(
     out = {
         "mode": mode,
         "iou_thres": float(iou_thres),
+        "dist_thres": float(dist_thres),
         "n_attack": 0,
         "n_targets": 0,
         "miss_no_defense": 0,
@@ -534,8 +548,12 @@ def evaluate_attack_miss(
         out["n_targets"] += len(tgts)
         init_boxes = _as_boxes7(getattr(fr.init, "boxes", None))
         def_boxes = frame_accepted_boxes(fr)
-        hits_init = [target_matched(init_boxes, t, iou_thres) for t in tgts]
-        hits_def = [target_matched(def_boxes, t, iou_thres) for t in tgts]
+        hits_init = [
+            target_matched(init_boxes, t, iou_thres, dist_thres) for t in tgts
+        ]
+        hits_def = [
+            target_matched(def_boxes, t, iou_thres, dist_thres) for t in tgts
+        ]
         if is_spoof:
             # Frame miss if any ghost still matched.
             miss_nd = any(hits_init)
@@ -597,8 +615,15 @@ def print_defense_metrics(frames, iou_levels=IOU_LEVELS):
             row["tp"], row["fp"], row["fn"], row["gt"]))
 
 
-def print_attack_miss(frames, mode: str, iou_thres: float = 0.3):
-    st = evaluate_attack_miss(frames, mode, iou_thres=iou_thres)
+def print_attack_miss(
+    frames,
+    mode: str,
+    iou_thres: float = 0.3,
+    dist_thres: float = 4.0,
+):
+    st = evaluate_attack_miss(
+        frames, mode, iou_thres=iou_thres, dist_thres=dist_thres
+    )
     if st["mode"] not in ATTACK_MODES or st["n_attack"] <= 0:
         print("\n=== Attack miss ===")
         print("  (no attack targets; mode={!r})".format(mode))
@@ -606,7 +631,11 @@ def print_attack_miss(frames, mode: str, iou_thres: float = 0.3):
     n = st["n_attack"]
     nt = st["n_targets"]
     is_spoof = st["mode"] in SPOOF_MODES
-    print("\n=== Attack miss (IoU>={:.2f}, per-frame targets) ===".format(float(iou_thres)))
+    print(
+        "\n=== Attack miss (IoU>={:.2f} OR dxy≤{:.1f}m, per-frame targets) ===".format(
+            float(iou_thres), float(dist_thres)
+        )
+    )
     print(
         "mode={}  attack_frames={}  target_instances={}".format(
             st["mode"], n, nt

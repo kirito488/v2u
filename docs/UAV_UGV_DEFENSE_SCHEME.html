@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UAV–UGV 协同感知防御方案</title>
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+  options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+};
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
+<style>
+:root {
+  --ink: #1c1917;
+  --muted: #57534e;
+  --line: #e7e5e4;
+  --bg: #fafaf9;
+  --card: #ffffff;
+  --accent: #0f766e;
+  --accent-soft: #ecfdf5;
+  --warn: #9a3412;
+  --warn-soft: #fff7ed;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: "Source Han Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 40px 28px 80px;
+  line-height: 1.75;
+  color: var(--ink);
+  background: var(--bg);
+}
+h1 { font-size: 1.65rem; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 0.4em; line-height: 1.3; }
+.sub { color: var(--muted); font-size: 0.95rem; margin: 0 0 2em; }
+h2 { margin-top: 2.4em; margin-bottom: 0.7em; font-size: 1.25rem; border-bottom: 2px solid var(--ink); padding-bottom: 0.35em; }
+h3 { margin-top: 1.5em; margin-bottom: 0.5em; font-size: 1.05rem; color: var(--accent); }
+h4 { margin-top: 1.1em; margin-bottom: 0.4em; font-size: 0.98rem; }
+p, li { font-size: 0.98rem; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.25em 0; }
+blockquote { border-left: 3px solid var(--accent); margin: 1em 0; padding: 0.6em 1em; background: var(--accent-soft); color: var(--ink); }
+blockquote.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; background: var(--card); font-size: 0.88rem; }
+th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+th { background: #f5f5f4; font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.good { color: #166534; font-weight: 600; }
+.bad { color: #991b1b; font-weight: 600; }
+.flow {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 1em 1.2em; margin: 1em 0; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 0.86rem; line-height: 1.65; white-space: pre-wrap;
+}
+.meta {
+  display: grid; grid-template-columns: auto 1fr; gap: 0.2em 1em;
+  font-size: 0.9rem; color: var(--muted); margin: 1em 0 1.5em;
+}
+.meta b { color: var(--ink); font-weight: 600; }
+hr { border: none; border-top: 1px solid var(--line); margin: 2.5em 0; }
+code { background: #f5f5f4; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+.param { font-size: 0.86rem; color: var(--muted); }
+.param b { color: var(--ink); font-weight: 600; }
+.tag {
+  display: inline-block; font-size: 0.72rem; font-weight: 600;
+  padding: 1px 6px; border-radius: 3px; margin-left: 4px; vertical-align: middle;
+}
+.tag-cal { background: #e0f2fe; color: #075985; }
+.tag-abl { background: #fef3c7; color: #92400e; }
+.tag-lock { background: #f5f5f4; color: #44403c; }
+.small { font-size: 0.86rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>UAV–UGV 协同感知防御方案</h1>
+<p class="sub">三源检测 → 空间门控 → 信任池 / Tentative 缓冲 → 接受集输出（报告指标）</p>
+
+<div class="meta">
+  <span>场景</span><b>V2U4Real，车（Ego）+ 无人机（UAV）协同 3D 检测</b>
+  <span>威胁</span><b>默认只攻击 UAV，不污染车端点云（<code>also_ego=False</code>）</b>
+  <span>攻击</span><b>spoof / remove / mass_remove / multi_spoof；early · intermediate · late</b>
+  <span>对比</span><b>ours（池+缓冲） vs Init（无防御） vs MADE</b>
+  <span>批次</span><b><code>20260904_210648</code>（旧全表）· 今日增量 <code>20260905</code> · AttFuse · <code>score_thres=0.3</code> · \(\theta_{\mathrm{confirm}}=0.7\)</b>
+</div>
+
+<blockquote>
+参数标注约定：每个符号后括号内为<strong>当前代码取值</strong>，并标明后续计划：
+<span class="tag tag-cal">分度校准</span> 用 clean / mild 攻击分位数或验证集扫；
+<span class="tag tag-abl">ablation</span> 做开关或网格消融；
+<span class="tag tag-lock">锁定</span> 几何/物理常数，原则上不扫。
+</blockquote>
+
+<!-- ========== 1 ========== -->
+<h2>1. 目标与输出</h2>
+<p>每帧并行得到三路检测：</p>
+<ul>
+  <li><strong>Ego</strong>：车载 PointPillar（本地点云，可信锚点）</li>
+  <li><strong>UAV</strong>：无人机 PointPillar（可被攻击）</li>
+  <li><strong>Init</strong>：中间融合 AttFuse（等权融合特征再检测）</li>
+</ul>
+<p>以 Ego 为空间锚做门控与证据更新；已确认目标进<strong>信任池</strong>，未确认目标进<strong>Tentative 缓冲</strong>。最终接受集（报告用 AP / ASR）为：</p>
+\[
+\hat{Y}
+=
+\{\text{pool 输出}\}
+\cup
+\{\text{本帧 Certain}\}
+\cup
+\{\text{缓冲 CONFIRM}\}
+\cup
+\{\text{池 ATTACK coast}\}
+\]
+<p class="small">
+池 ATTACK 的 KF coast 框（已确认目标被抹除时的暂存）计入接受集
+（<code>ACCEPTED_STATES</code> 含 <code>"attack"</code>）。缓冲侧的 ATTACK 只打标、<strong>不进</strong> \(\hat{Y}\)。
+\(\hat{Y}\) 是后续 AP / ASR 的主要依据。
+</p>
+<blockquote>
+核心思想（ROBOSAC）：协同应与单车<strong>共识</strong>而非分歧。Ambiguous 用 Dual（UAV∧Init）升 Certain；Tentative 用 Ego 证据贝叶斯观察；池内丢失且 UAV 本应可见则 ATTACK coast。
+</blockquote>
+
+<!-- ========== 2 ========== -->
+<h2>2. 检测表示与感知置信度 \(C\)</h2>
+
+<h3>2.1 检测元组</h3>
+<p>每个检测：框 \(\mathbf{B}=(x,y,z,l,w,h,\theta)\)、存在概率 \(P\)、感知置信度 \(C\)。检出标志</p>
+\[
+D = \mathbf{1}\{P \ge \theta_P\}
+\quad\text{且与当前物体匈牙利关联成功}
+\]
+<p class="param">
+\(\theta_P\) / <code>score_thres</code>（当前批 <b>0.3</b>；代码默认 <code>THETA_P=0.5</code>）
+<span class="tag tag-cal">分度校准</span>
+— 跑批时 CLI 设 0.3，同时把防御内部的 <code>theta_p</code> 设为同一值。
+</p>
+<p>检测质量：</p>
+\[
+Q = P \cdot C
+\]
+<p>\(P\) 来自检测头分类分；\(C\) <strong>只由该源点云</strong>决定，不回填分类分。</p>
+
+<h3>2.2 \(C\) 的完整计算</h3>
+<p>设计目标：回答「这个传感器是否把物体看清楚了？」拆成绝对点数与距离归一化相对点数：</p>
+\[
+C = C_{\mathrm{abs}} \cdot C_n
+\]
+\[
+C_{\mathrm{abs}} = \mathrm{clip}\!\left(\frac{n}{n_{\mathrm{ref}}},\,0,\,1\right),\qquad
+C_n = \mathrm{clip}\!\left(\frac{n}{n_{\mathrm{exp}}},\,0,\,1\right)
+\]
+
+<h4>2.2.1 框内点数 \(n\)</h4>
+<ul>
+  <li>检测框先从 OpenCOOD 的 <em>bottom-center</em> 抬到几何中心：\(z \leftarrow z + h/2\)。</li>
+  <li>在<strong>该源</strong> LiDAR 坐标系下统计落入框内（含 pad）的点数 \(n\)。</li>
+</ul>
+<p class="param">
+Ego pad（<b>0.25 m</b>）· UAV pad（<b>0.5 m</b>）
+<span class="tag tag-abl">ablation</span>
+— UAV 顶视框略松；可消融 pad 对 \(C\) / ASR 的影响。
+</p>
+
+<h4>2.2.2 绝对项 \(C_{\mathrm{abs}}\)</h4>
+<p>\(n_{\mathrm{ref}}\) 表示「典型车辆在清晰观测下」的参考点数：</p>
+<p class="param">
+\(n_{\mathrm{ref}}^{\mathrm{ego}}\)（<b>40</b>）· \(n_{\mathrm{ref}}^{\mathrm{uav}}\)（<b>25</b>）
+<span class="tag tag-cal">分度校准</span>
+— 建议用 clean val 上 TP 框点数的分位数（如 p50–p70）重标定。
+</p>
+
+<h4>2.2.3 期望点数 \(n_{\mathrm{exp}}\) 与相对项 \(C_n\)</h4>
+<p>先算传感器可见面积 \(A\) 与参考面积 \(A_{\mathrm{ref}}\)，再按 \(1/r^2\) 衰减：</p>
+\[
+n_{\mathrm{exp}} = n_0 \cdot \frac{A}{A_{\mathrm{ref}}} \cdot \left(\frac{r_0}{r}\right)^2
+\]
+\[
+r = \max\!\big(\sqrt{x^2+y^2},\, r_{\min}\big)
+\]
+
+<p><strong>Ego（侧视）</strong>：相对方位 \(\varphi=\mathrm{atan2}(y,x)\)，相对航向 \(\mathrm{rel}=\theta-\varphi\)，</p>
+\[
+A_{\mathrm{ego}} = h \cdot \big(l\,|\sin(\mathrm{rel})| + w\,|\cos(\mathrm{rel})|\big)
+\]
+\[
+A_{\mathrm{ref}}^{\mathrm{ego}} = h_{\mathrm{ref}} \cdot l_{\mathrm{ref}}
+\]
+
+<p><strong>UAV（顶视）</strong>：</p>
+\[
+A_{\mathrm{uav}} = l \cdot w,\qquad
+A_{\mathrm{ref}}^{\mathrm{uav}} = l_{\mathrm{ref}} \cdot w_{\mathrm{ref}}
+\]
+
+<p class="param">
+\(n_0\)（默认 \(=n_{\mathrm{ref}}\)，Ego <b>40</b> / UAV <b>25</b>）
+<span class="tag tag-cal">分度校准</span>；
+\(r_0\)（<b>20 m</b>）
+<span class="tag tag-lock">锁定</span> 近场参考距离；
+\(r_{\min}\)（<b>4 m</b>）
+<span class="tag tag-lock">锁定</span> 防除零；
+\((l,w,h)_{\mathrm{ref}}\)（<b>4.5, 1.8, 1.5 m</b>）
+<span class="tag tag-lock">锁定</span> 典型乘用车尺寸。
+</p>
+
+<h4>2.2.4 三源各自算 \(C\)；Init 取平均</h4>
+<ul>
+  <li>Ego / UAV：各自用自己的点云与原点算 \(C_{\mathrm{ego}}, C_{\mathrm{uav}}\)。</li>
+  <li>Init 融合特征若直接计点会被攻击抬高假 \(C\)，故</li>
+</ul>
+\[
+C_{\mathrm{init}} = \tfrac{1}{2}\big(C_{\mathrm{ego}} + C_{\mathrm{uav}}\big)
+\]
+<p class="small">实现：对 Init 框分别变换到 Ego / UAV 坐标系后计点再平均（见 <code>confidence.py</code> / 三源组装）。</p>
+
+<!-- ========== 3 ========== -->
+<h2>3. 同帧关联</h2>
+<p>Ego–UAV、Ego–Init 做匈牙利匹配，代价 \(1-\mathrm{IoU}\)（BEV）。IoU 过阈才视为同一物体，得到</p>
+\[
+D_{\mathrm{ego}},\, D_{\mathrm{uav}},\, D_{\mathrm{init}} \in \{0,1\}
+\]
+<p class="param">
+\(\theta_{\mathrm{IoU}}\)（<b>0.3</b>，<code>THETA_IOU</code>）
+<span class="tag tag-abl">ablation</span>；
+距离门 \(\theta_d\)（<b>4.0 m</b>，<code>THETA_DIST</code>，备用）
+<span class="tag tag-abl">ablation</span>。
+</p>
+<p>跨帧一致性由池 / 缓冲的常速度 KF 承担，不做「整帧丢弃协作源」。</p>
+
+<!-- ========== 4 ========== -->
+<h2>4. 空间门控</h2>
+<p>对以 Ego 为锚的物体，用 \(Q_{\mathrm{ego}}=P_{\mathrm{ego}}\cdot C_{\mathrm{ego}}\) 分三态：</p>
+<table>
+  <tr><th>状态</th><th>条件</th><th>处理</th></tr>
+  <tr>
+    <td><strong>Certain</strong></td>
+    <td>\(D_{\mathrm{ego}}=1\) 且 \(Q_{\mathrm{ego}} \ge Q_h\)</td>
+    <td>采信 Ego 几何；可入池 UPDATE / BIRTH；本帧直接进接受集</td>
+  </tr>
+  <tr>
+    <td><strong>Ambiguous</strong></td>
+    <td>\(D_{\mathrm{ego}}=1\) 且 \(Q_l \le Q_{\mathrm{ego}} &lt; Q_h\)</td>
+    <td>看 Dual：UAV 与 Init 都命中 → Certain，否则 → Tentative</td>
+  </tr>
+  <tr>
+    <td><strong>Tentative</strong></td>
+    <td>其余（无 Ego，或 \(Q\) 过低，或 Dual 失败）</td>
+    <td>本帧不直接输出，进缓冲观察</td>
+  </tr>
+</table>
+\[
+Q_h = \theta_P^{\mathrm{default}} \cdot \mu_h,\qquad
+Q_l = \theta_P^{\mathrm{default}} \cdot \mu_l
+\]
+<p class="param">
+代码常量：\(\mu_h\)（<b>0.7</b>）· \(\mu_l\)（<b>0.5</b>）→ \(Q_h=\mathbf{0.35}\)、\(Q_l=\mathbf{0.25}\)
+（仍按默认 \(\theta_P=0.5\) 算出，<strong>未</strong>随批实验 <code>score_thres=0.3</code> 重标定）
+<span class="tag tag-cal">分度校准</span>
+— 计划：令 \(Q_h=\theta_P\cdot\mu_h\)、\(Q_l=\theta_P\cdot\mu_l\) 与当前 \(\theta_P\) 联动，或单独扫分位数。
+</p>
+\[
+\mathrm{Dual} = (D_{\mathrm{uav}}=1) \wedge (D_{\mathrm{init}}=1)
+\]
+<p>门控 / 池仍只用硬分轨（\(P\ge\theta_P\)）；缓冲对<strong>已有 watch</strong> 另开软 Ego 带：低分 Ego 只加正证据，不新建、不进 Certain。</p>
+<p class="param">
+\(\theta_{\mathrm{soft}}\)（<b>0.05</b>，<code>THETA_SOFT</code>）
+<span class="tag tag-lock">锁定</span>
+— 软带 \([\theta_{\mathrm{soft}},\,\theta_P)\)。
+</p>
+
+<!-- ========== 5 ========== -->
+<h2>5. 信任池</h2>
+<p>已确认轨维护常速度 KF（状态 \((x,y,v_x,v_y)\)）。每帧：预测 → Certain Ego 匹配 → 其余源 HOLD → 全 miss 再判 ATTACK / MISS。</p>
+<table>
+  <tr><th>动作</th><th>含义</th></tr>
+  <tr><td>UPDATE</td><td>Certain Ego 命中 → KF 更新，框进 \(\hat{Y}\)</td></tr>
+  <tr><td>BIRTH</td><td>Certain Ego 无匹配轨 → 新建</td></tr>
+  <tr><td>HOLD</td><td>非 Certain 路径上 Ego / UAV / Init 任一命中 → 保留但不更新 KF</td></tr>
+  <tr><td>ATTACK</td><td>三源皆 miss，且 UAV 本应看见 → KF <strong>coast 进 \(\hat{Y}\)</strong></td></tr>
+  <tr><td>MISS / DROP</td><td>三源 miss 且 UAV 不可见（或超龄）→ 短保留后丢弃</td></tr>
+</table>
+<p class="param">
+池保留龄 \(K\)（<b>3</b>，<code>POOL_K</code>）
+<span class="tag tag-abl">ablation</span>。
+BIRTH / CONFIRM 入池时，KF 速度用缓冲轨迹差分初始化（优先 ego 源 hist，否则 fuse/init；<code>velocity_from_traj</code> / <code>birth_state(..., traj=)</code>），避免静止先验。
+</p>
+
+<h3>5.1 UAV「本应看见」</h3>
+<ul>
+  <li>框须在 UAV FOV 内（<code>uav_fov.box_in_uav_fov</code>）；FOV 外只用 \(C_{\mathrm{uav}}\)；</li>
+  <li>FOV 内：把框 warp 到 UAV 系后，用 <strong>UAV 点云 polar 深度图</strong>算视线得分 \(V_{\mathrm{uav}}\)（见 §6.1.1）；</li>
+  <li>或框内 UAV 点密度给出的 \(C_{\mathrm{uav}}\)；</li>
+  <li>综合可见度</li>
+</ul>
+\[
+u = \max(V_{\mathrm{uav}},\, C_{\mathrm{uav}})
+\]
+<p>过阈则判 suppression（remove 攻击下的「本该看见却 miss」）。</p>
+<p class="param">
+\(v_{\min}\) / 攻击可见阈（<b>0.25</b>，<code>V_MIN</code>）
+<span class="tag tag-abl">ablation</span>；
+连续 miss 判 ATTACK 的龄 \(k_{\mathrm{atk}}\)（<b>10</b>，<code>K_ATK</code>）
+<span class="tag tag-abl">ablation</span>。
+</p>
+<blockquote>
+用 UAV 视线而不是车端射线：Ego 漏检常因遮挡，车端可见度会系统性偏低。点云 remove 会压低密度，射线穿透仍可判 ATTACK。<br>
+<strong>池 ATTACK</strong> = 已确认目标被抹，coast 进输出；
+<strong>缓冲 ATTACK</strong> = 仍不确定，只打标，<strong>不进</strong> \(\hat{Y}\)。
+</blockquote>
+
+<!-- ========== 6 ========== -->
+<h2>6. Tentative 缓冲</h2>
+<p>观察中目标维护后验 \(\mathcal{P}\) 与 KF。初值以中性先验 \(0.5\) 为中心，按协作占比与 Ego 质量门控缩放；无全局信任分。</p>
+\[
+\mathcal{P}_0 = \max\!\big(0.5 \cdot g_{\mathrm{uav}}(Q_{\mathrm{collab}}, Q_{\mathrm{ego}}) \cdot s(Q),\, P_{\min}\big)
+\]
+\[
+g_{\mathrm{uav}} = \frac{Q_{\mathrm{collab}}}{Q_{\mathrm{ego}}+Q_{\mathrm{collab}}}\,\varphi(Q_{\mathrm{ego}}),\qquad
+\varphi(Q)=\sigma\!\left(\frac{Q_l-Q}{\tau}\right),\qquad
+s(Q)=\mathrm{clip}\!\left(\frac{Q}{Q_l},\,P_{\min},\,1\right)
+\]
+<p class="param">
+\(P_{\min}\)（<b>0.15</b>）
+<span class="tag tag-abl">ablation</span>；
+\(\tau\)（<b>0.1</b>）
+<span class="tag tag-lock">锁定</span> sigmoid 温度。
+</p>
+
+<h3>6.1 证据（只看 Ego）</h3>
+<p>可见度 \(v\) 用<strong>车端 LiDAR polar 深度</strong>（缓冲问的是「车该不该看见」；见 §6.1.1）。正/负证据：</p>
+\begin{align}
+w(v) &= 1 + \sigma\!\left(\frac{0.5 - v}{\tau}\right) \in (1,2) \\
+e_+ &= +\kappa_+\,\psi(Q_{\mathrm{ego}})\,w(v)
+\quad\text{（硬 / 软 Ego 命中）} \\
+e_- &= -\kappa_-\,v
+\quad\text{（未命中 Ego，含仅有 UAV/Init）} \\
+\psi(Q) &= \sigma\!\left(\frac{Q - Q_l}{\tau}\right) = 1-\varphi(Q)
+\end{align}
+\[
+\mathrm{logit}(\mathcal{P}_t) = \mathrm{logit}(\mathcal{P}_{t-1}) + e
+\]
+<p>\(\psi(Q)\) 随 Ego 质量升高；开敞漏检（\(v\approx 1\)）重罚，遮挡漏检轻罚。UAV/Init 从不单独加正分。</p>
+<p class="param">
+\(\kappa_+\)（<b>1.4</b>）· \(\kappa_-\)（<b>1.0</b>）
+<span class="tag tag-abl">ablation</span>；
+\(v_0\)（<b>0.5</b>，与先验中点共用）
+<span class="tag tag-lock">锁定</span>。
+</p>
+
+<h3>6.1.1 可见度 \(V\)：点云 polar 深度（今日替换旧 box-ray）</h3>
+<p>
+旧实现：从原点向框打 BEV 射线，用<strong>其它检测框</strong>当遮挡物——曾因未传入 occluders 经常得到 \(V\equiv 1\)。<br>
+<strong>当前实现</strong>（<code>occlusion.build_polar_depth</code> / <code>visibility_ratio_lidar</code>）：
+</p>
+<ol>
+  <li>把本帧点云建成传感器系 polar 最小距离图（方位 0.5° × 俯仰 1°）；</li>
+  <li>在查询 OBB 上采密网格 <b>5×5×3 = 75</b> 个 3D 探针；</li>
+  <li>每条射线：若同方向深度图上有<strong>比目标近端面更近</strong>的回波 → 挡住；否则穿透；</li>
+  <li>\(V =\) 穿透数 / 75。</li>
+</ol>
+<p>
+检测框原点是<strong>底面中心</strong>。Ego 路径设 <code>bottom_center=True</code>：先 \(z\leftarrow z+h/2\) 抬到体心再采样，
+使三层高度覆盖 <strong>车底～车顶</strong>（原先相对车底采样会采到地下、采不到车顶，易被地面点误挡 → 假 \(V=0\)）。
+UAV 路径则先几何中心化再 warp 到 UAV 系。
+</p>
+<p class="param">
+缓冲经 <code>visibility_fn=_ego_vis</code>（ego 深度图）；池 ATTACK 用 UAV 深度图 + FOV。
+无点云时回退 \(V=1\)（保守不标 ATTACK）。
+</p>
+
+<h3>6.2 判决</h3>
+<ul>
+  <li>\(\mathcal{P} \ge \theta_{\mathrm{confirm}}\) → <strong>CONFIRM</strong>，输出并可入池</li>
+  <li>\(\mathcal{P} \le \theta_{\mathrm{reject}}\) → <strong>REJECT</strong></li>
+  <li>年龄 \(\ge T_{\mathrm{timeout}}\) 且 \(\mathcal{P}\) 仍不高 → <strong>TIMEOUT</strong></li>
+</ul>
+<p class="param">
+\(\theta_{\mathrm{confirm}}\)（<b>0.7</b>，今日由 0.9 下调）· \(\theta_{\mathrm{reject}}\)（<b>0.1</b>）· \(T_{\mathrm{timeout}}\)（<b>10</b>）
+<span class="tag tag-abl">ablation</span>
+— 主消融轴：偏 CONFIRM 提召回 vs 偏 REJECT 降幽灵。0.9 时 GT 命中 watch 的 lifetime max \(\mathcal{P}\) 多 &lt; 0.65，几乎不 confirm。
+</p>
+
+<!-- ========== 7 ========== -->
+<h2>7. 每帧流程</h2>
+<div class="flow">1. 三源检测；算 C、Q
+2. 匈牙利关联 → D_ego, D_uav, D_init
+3. 门控：Certain / Ambiguous(Dual) / Tentative
+4. 信任池：UPDATE / BIRTH / HOLD；全 miss + UAV 可见 → ATTACK coast
+5. Tentative 缓冲：Ego 证据更新；CONFIRM → Ŷ；缓冲 ATTACK 只打标
+6. 接受集 = pool ∪ Certain ∪ CONFIRM ∪ 池 ATTACK coast</div>
+
+<!-- ========== 8 ========== -->
+<h2>8. 主要实验结果</h2>
+<p>
+Batch <code>20260904_210648</code> · AttFuse · <code>score_thres=0.3</code> · 全 val scenes（10 scenes × 2750 frames）· 只攻 UAV · 对比基线 MADE。<br>
+报告指标为<strong>接受集</strong>（accepted）上的 AP / Recall / ASR；AP/R 默认 IoU=0.5，另附 AP@.25 / AP@.7。
+</p>
+<p>
+<strong>ASR</strong>：remove = 目标在接受集中缺失；spoof = 幽灵仍被当作真实目标。防御有效时，强攻击下 ASR 应下降。<br>
+<strong>AP / Recall</strong>：相对 GT 的检测质量。防御在压 ASR 的同时应尽量保住召回。
+</p>
+
+<h3>8.1 总表（ASR + AP@0.5 + Recall@0.5）</h3>
+<table>
+  <tr>
+    <th>攻击</th>
+    <th class="num">Init ASR</th>
+    <th class="num">ours ASR</th>
+    <th class="num">MADE ASR</th>
+    <th class="num">Init AP / R</th>
+    <th class="num">ours AP / R</th>
+    <th class="num">MADE AP@.5</th>
+    <th class="num">Δ ASR Init→ours</th>
+  </tr>
+  <tr>
+    <td>remove_early</td>
+    <td class="num">62.2%</td>
+    <td class="num bad">75.8%</td>
+    <td class="num">79.0%</td>
+    <td class="num">0.464 / 0.500</td>
+    <td class="num">0.393 / 0.446</td>
+    <td class="num">0.391</td>
+    <td class="num bad">+13.6 pp</td>
+  </tr>
+  <tr>
+    <td>remove_intermediate</td>
+    <td class="num">99.9%</td>
+    <td class="num good">60.7%</td>
+    <td class="num">72.2%</td>
+    <td class="num">0.263 / 0.396</td>
+    <td class="num good">0.344 / 0.429</td>
+    <td class="num">0.361</td>
+    <td class="num good">−39.2 pp</td>
+  </tr>
+  <tr>
+    <td>remove_late</td>
+    <td class="num">21.6%</td>
+    <td class="num bad">53.1%</td>
+    <td class="num">64.5%</td>
+    <td class="num">0.491 / 0.535</td>
+    <td class="num">0.391 / 0.447</td>
+    <td class="num">0.393</td>
+    <td class="num bad">+31.5 pp</td>
+  </tr>
+  <tr>
+    <td>spoof_early</td>
+    <td class="num">24.7%</td>
+    <td class="num good">6.2%</td>
+    <td class="num">5.7%</td>
+    <td class="num">0.453 / 0.534</td>
+    <td class="num">0.387 / 0.447</td>
+    <td class="num">0.386</td>
+    <td class="num good">−18.5 pp</td>
+  </tr>
+  <tr>
+    <td>spoof_intermediate</td>
+    <td class="num">67.6%</td>
+    <td class="num good">0.8%</td>
+    <td class="num">5.8%</td>
+    <td class="num">0.342 / 0.536</td>
+    <td class="num good">0.391 / 0.448</td>
+    <td class="num">0.371</td>
+    <td class="num good">−66.8 pp</td>
+  </tr>
+  <tr>
+    <td>spoof_late</td>
+    <td class="num">0.1%</td>
+    <td class="num">0.1%</td>
+    <td class="num">—</td>
+    <td class="num">0.491 / 0.536</td>
+    <td class="num">0.393 / 0.449</td>
+    <td class="num">—</td>
+    <td class="num">0.0 pp</td>
+  </tr>
+  <tr>
+    <td>mass_remove_intermediate</td>
+    <td class="num">98.7%</td>
+    <td class="num good">69.1%</td>
+    <td class="num">63.2%</td>
+    <td class="num">0.227 / 0.315</td>
+    <td class="num good">0.314 / 0.406</td>
+    <td class="num">0.353</td>
+    <td class="num good">−29.6 pp</td>
+  </tr>
+  <tr>
+    <td>multi_spoof_intermediate</td>
+    <td class="num">45.1%</td>
+    <td class="num good">0.6%</td>
+    <td class="num">1.2%</td>
+    <td class="num">0.244 / 0.512</td>
+    <td class="num good">0.389 / 0.447</td>
+    <td class="num">0.356</td>
+    <td class="num good">−44.5 pp</td>
+  </tr>
+</table>
+<p class="small">MADE 列 AP 为 Defense comparison 的 AP@.5（接受/回放框）；ours 的 AP/R 为 accepted-state 表 IoU=0.5。Init AP/R 为同批 <code>init</code> 检测相对 GT。</p>
+
+<h3>8.2 ours 接受集多阈值 AP</h3>
+<table>
+  <tr>
+    <th>攻击</th>
+    <th class="num">AP@.25</th>
+    <th class="num">AP@.5</th>
+    <th class="num">AP@.7</th>
+    <th class="num">R@.5</th>
+    <th class="num">P@.5</th>
+  </tr>
+  <tr><td>remove_early</td><td class="num">0.404</td><td class="num">0.393</td><td class="num">0.309</td><td class="num">0.446</td><td class="num">0.822</td></tr>
+  <tr><td>remove_intermediate</td><td class="num">0.358</td><td class="num">0.344</td><td class="num">0.269</td><td class="num">0.429</td><td class="num">0.746</td></tr>
+  <tr><td>remove_late</td><td class="num">0.401</td><td class="num">0.391</td><td class="num">0.307</td><td class="num">0.447</td><td class="num">0.816</td></tr>
+  <tr><td>spoof_early</td><td class="num">0.399</td><td class="num">0.387</td><td class="num">0.304</td><td class="num">0.447</td><td class="num">0.810</td></tr>
+  <tr><td>spoof_intermediate</td><td class="num">0.402</td><td class="num">0.391</td><td class="num">0.306</td><td class="num">0.448</td><td class="num">0.812</td></tr>
+  <tr><td>spoof_late</td><td class="num">0.403</td><td class="num">0.393</td><td class="num">0.308</td><td class="num">0.449</td><td class="num">0.814</td></tr>
+  <tr><td>mass_remove_intermediate</td><td class="num">0.336</td><td class="num">0.314</td><td class="num">0.245</td><td class="num">0.406</td><td class="num">0.723</td></tr>
+  <tr><td>multi_spoof_intermediate</td><td class="num">0.400</td><td class="num">0.389</td><td class="num">0.304</td><td class="num">0.447</td><td class="num">0.811</td></tr>
+</table>
+
+<blockquote class="warn">
+<strong>解读</strong>：中间层 remove / 各类 spoof 上，ours 相对 Init 明显降 ASR；spoof 上 AP 也常优于 Init（幽灵被滤掉）。
+<strong>remove_early / remove_late</strong> 上 ours ASR 反而高于 Init——早/晚删点后 Init 仍常能检出，缓冲 ATTACK 又不进接受集，恢复不足；这是当前主要短板。
+mass_remove 上 MADE 的 ASR/AP 略优于 ours；remove_intermediate 上 ours ASR 更好但 MADE AP 略高。
+</blockquote>
+
+<!-- ========== 9 ========== -->
+<h2>9. 参数一览（代码取值 + 计划）</h2>
+<table>
+  <tr><th>符号 / 名</th><th>当前取值</th><th>计划</th><th>说明</th></tr>
+  <tr><td>\(\theta_P\) / score_thres</td><td>批 0.3（默认常量 0.5）</td><td><span class="tag tag-cal">分度</span></td><td>检出硬阈；批实验与防御内部统一</td></tr>
+  <tr><td>\(Q_h,Q_l\)</td><td>0.35 / 0.25</td><td><span class="tag tag-cal">分度</span></td><td>目前未随 0.3 联动，建议重标定</td></tr>
+  <tr><td>\(n_{\mathrm{ref}}^{\mathrm{ego/uav}}\)</td><td>40 / 25</td><td><span class="tag tag-cal">分度</span></td><td>\(C_{\mathrm{abs}}\) 分母</td></tr>
+  <tr><td>\(r_0,r_{\min},(lwh)_{\mathrm{ref}}\)</td><td>20 / 4 / 4.5·1.8·1.5</td><td><span class="tag tag-lock">锁定</span></td><td>\(n_{\mathrm{exp}}\) 几何常数</td></tr>
+  <tr><td>pad ego/uav</td><td>0.25 / 0.5 m</td><td><span class="tag tag-abl">ablation</span></td><td>计点膨胀</td></tr>
+  <tr><td>\(\theta_{\mathrm{IoU}},\theta_d\)</td><td>0.3 / 4.0 m</td><td><span class="tag tag-abl">ablation</span></td><td>同帧关联</td></tr>
+  <tr><td>\(\theta_{\mathrm{soft}}\)</td><td>0.05</td><td><span class="tag tag-lock">锁定</span></td><td>缓冲软 Ego 带下界</td></tr>
+  <tr><td>\(\theta_{\mathrm{confirm/reject}},T\)</td><td><b>0.7</b> / 0.1 / 10</td><td><span class="tag tag-abl">ablation</span></td><td>缓冲判决主轴（今日 0.9→0.7）</td></tr>
+  <tr><td>polar \(V\) 网格 / 角分辨率</td><td>5×5×3 · 0.5°/1°</td><td><span class="tag tag-abl">ablation</span></td><td>点云遮挡；底心→体心 lift</td></tr>
+  <tr><td>\(\kappa_+,\kappa_-\)</td><td>1.4 / 1.0</td><td><span class="tag tag-abl">ablation</span></td><td>正负证据强度</td></tr>
+  <tr><td>\(\tau,P_{\min},v_0\)</td><td>0.1 / 0.15 / 0.5</td><td><span class="tag tag-lock">锁定</span> / 弱 abl</td><td>sigmoid 与先验地板</td></tr>
+  <tr><td>\(V_{\min},K_{\mathrm{atk}},\mathrm{POOL}_K\)</td><td>0.25 / 10 / 3</td><td><span class="tag tag-abl">ablation</span></td><td>池 ATTACK / 保留</td></tr>
+  <tr><td>accept 含 attack</td><td>是</td><td><span class="tag tag-abl">ablation</span></td><td>池 coast 是否计入报告</td></tr>
+  <tr><td>MADE match / φ</td><td>0.83 / 1.0</td><td><span class="tag tag-cal">分度</span></td><td>基线阈值；φ 可锁定</td></tr>
+  <tr><td>CAD thres</td><td>1.7</td><td><span class="tag tag-cal">分度</span></td><td>占用基线（本批正式表未列）</td></tr>
+</table>
+
+<!-- ========== 10 ========== -->
+<h2>10. 今日改动纪要（2026-09-05）</h2>
+<p class="small">代码仓库：<code>CollaborativePerceptionDefense</code> · 方案 HTML 同步更新。</p>
+
+<h3>10.1 可见性 \(V\)（最大改动）</h3>
+<ul>
+  <li><strong>问题</strong>：旧 box-ray 未传入 occluders → 日志里大量 \(V=1\)；与真实遮挡无关。</li>
+  <li><strong>改为</strong>：ego / UAV 点云 <code>build_polar_depth</code> + <code>visibility_ratio_lidar</code>；缓冲 <code>visibility_fn</code> 接 ego 深度；池 ATTACK 接 UAV LOS。</li>
+  <li><strong>采样</strong>：框内 5×5×3=75 探针；通射线比例为 \(V\)。</li>
+  <li><strong>底心修正</strong>：检测框 \(z\) 在车底；Ego 路径 <code>bottom_center=True</code>（\(z+=h/2\)）后再采，高度覆盖车底～车顶，避免贴地/地下探针被地面点误挡（假 \(V=0\)）。</li>
+  <li><strong>UAV FOV</strong>：新增 <code>defense/uav_fov.py</code>；FOV 外不用假 LOS，只用 \(C_{\mathrm{uav}}\)。</li>
+</ul>
+
+<h3>10.2 缓冲 / 池动力学</h3>
+<ul>
+  <li>\(\theta_{\mathrm{confirm}}\colon 0.9\to\mathbf{0.7}\)（<code>THETA_CONFIRM</code>）。0.9 时 GT-hit watch 的 max \(\mathcal{P}\) 多 &lt;0.65，几乎不 confirm。</li>
+  <li>软 Ego 带 \([\theta_{\mathrm{soft}},\theta_P)\) 继续给已有 watch 加正证据；verbose 在 GT 上标注 <code>soft-ego P=… V=… iou=…</code>。</li>
+  <li>KF 出生速度：<code>velocity_from_traj</code>；缓冲 traj 优先 ego hist；池 <code>ingest(..., trajs=)</code> / <code>seed_velocity_from_trajs</code>。</li>
+  <li>池：仅 Certain Ego 做完整 <code>kf_update</code>；其它源 snap xy，不收缩 \(P\)。</li>
+</ul>
+
+<h3>10.3 实验与队列</h3>
+<ul>
+  <li>全 val <strong>remove_early</strong>（\(\theta_{\mathrm{confirm}}=0.7\)，ours only，双卡拆 scene）：Init ASR <b>60.5%</b>，Defense ASR <b>66.9%</b>；Accept@0.5 P=<b>0.883</b> R=<b>0.462</b>（相对 9/4 夜 75.8% ASR / P 0.822 / R 0.446 有改善，但仍 Defense&gt;Init）。</li>
+  <li>全 val <strong>clean</strong>（mode=none，defense=all vs MADE）：Accept@0.5 AP <b>0.430</b> P <b>0.869</b> R <b>0.470</b>；Init AP 0.492 / R 0.536；MADE AP@0.5 <b>0.394</b>（干净下 ours &gt; MADE）。</li>
+  <li>进行中：干净+全攻击 <code>defense=all</code>（ours vs MADE）队列 <code>20260905_182559</code>（remove/spoof × early/inter/late + mass/multi）。</li>
+</ul>
+
+<h3>10.4 干净场景结果表（今日）</h3>
+<table>
+  <tr>
+    <th>来源</th>
+    <th class="num">AP@0.25</th>
+    <th class="num">AP@0.5</th>
+    <th class="num">AP@0.7</th>
+    <th class="num">P@0.5</th>
+    <th class="num">R@0.5</th>
+  </tr>
+  <tr>
+    <td>Init（无防御）</td>
+    <td class="num">0.507</td><td class="num">0.492</td><td class="num">0.317</td>
+    <td class="num">0.871</td><td class="num">0.536</td>
+  </tr>
+  <tr>
+    <td>ours Accept</td>
+    <td class="num">0.437</td><td class="num">0.430</td><td class="num">0.330</td>
+    <td class="num">0.869</td><td class="num">0.470</td>
+  </tr>
+  <tr>
+    <td>MADE</td>
+    <td class="num">0.396</td><td class="num">0.394</td><td class="num">0.316</td>
+    <td class="num">—</td><td class="num">—</td>
+  </tr>
+</table>
+<p class="small">日志 / JSON：<code>logs/clean_none_20260905_182559.*</code> · remove_early(tc07)：<code>logs/remove_early_tc07_20260905_172246_gpu{2,4}.*</code></p>
+
+<blockquote>
+<strong>仍待观察</strong>：\(n_{\mathrm{ref}}\) / \(A_{\mathrm{ref}}\) 是否按清晰可见分位数重标定（讨论过，未改代码）；
+全攻击 ours vs MADE 表跑完后替换 §8 旧批次。
+</blockquote>
+
+<hr>
+<p class="small">
+文件路径：<code>/data/hzy/lxt/CollaborativePerceptionDefense/logs/experiment/UAV_UGV_DEFENSE_SCHEME.html</code><br>
+同步副本：<code>/data/hzy/lxt/AdvCollaborativePerception-master/UAV_UGV_DEFENSE_SCHEME.html</code><br>
+<!-- synced 2026-09-05: polar V, θ_confirm=0.7, KF birth vel, clean/MADE, changelog §10 -->
+</p>
+
+</body>
+</html>

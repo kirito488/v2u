@@ -190,7 +190,11 @@ class GatedObject:
     def dump_line(self, k: int) -> str:
         b = self.box if self.box is not None else np.zeros(7)
         return (
-            "  #{:<2d}  {:<26s}  D=({}{}{})  Dual={}  Q={:.3f}  P={:.3f}  C={:.3f}  "
+            "  #{:<2d}  {:<26s}  D=({}{}{})  Dual={}  "
+            "Q_ego={:.3f}  P_ego={:.3f}  C_ego={:.3f}  "
+            "P_uav={:.3f}  C_uav={:.3f}  IoU_u={:.2f}  "
+            "P_init={:.3f}  C_init={:.3f}  IoU_i={:.2f}  "
+            "idx=(e{} u{} i{})  "
             "B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]".format(
                 k,
                 self.display_state,
@@ -201,6 +205,15 @@ class GatedObject:
                 self.q_ego,
                 self.p_ego,
                 self.c_ego,
+                self.p_uav,
+                self.c_uav,
+                self.iou_uav,
+                self.p_init,
+                self.c_init,
+                self.iou_init,
+                self.ego_i,
+                self.uav_i,
+                self.init_i,
                 b[0],
                 b[1],
                 b[2],
@@ -449,3 +462,30 @@ def gate_frame(
         q_h=q_h,
         q_l=q_l,
     )
+
+
+def traj_ref_box(obj, ego=None, uav=None, init=None):
+    """Box for velocity / backfill traj: ego if present, else fuse(init), else UAV.
+
+    Returns (box7, source_tag) or (None, "").
+    """
+    if obj is None:
+        return None, ""
+    ei = int(getattr(obj, "ego_i", -1))
+    ii = int(getattr(obj, "init_i", -1))
+    ui = int(getattr(obj, "uav_i", -1))
+    if int(getattr(obj, "d_ego", 0)) == 1 and ego is not None and ei >= 0:
+        boxes = getattr(ego, "boxes", None)
+        if boxes is not None and ei < len(boxes):
+            return np.asarray(boxes[ei], dtype=np.float64)[:7].copy(), "ego"
+    if int(getattr(obj, "d_init", 0)) == 1 and init is not None and ii >= 0:
+        boxes = getattr(init, "boxes", None)
+        if boxes is not None and ii < len(boxes):
+            return np.asarray(boxes[ii], dtype=np.float64)[:7].copy(), "fuse"
+    if int(getattr(obj, "d_uav", 0)) == 1 and uav is not None and ui >= 0:
+        boxes = getattr(uav, "boxes", None)
+        if boxes is not None and ui < len(boxes):
+            return np.asarray(boxes[ui], dtype=np.float64)[:7].copy(), "uav"
+    if getattr(obj, "box", None) is not None:
+        return np.asarray(obj.box, dtype=np.float64)[:7].copy(), "box"
+    return None, ""

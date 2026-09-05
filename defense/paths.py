@@ -9,10 +9,13 @@ _BUNDLED_V2U4 = os.path.join(_REPO_ROOT, "V2U4Real")
 _BUNDLED_ATTACK = os.path.join(_REPO_ROOT, "AdvCollaborativePerception")
 
 
-def first_existing(candidates):
+def first_existing(candidates, require_subdir=None):
     for p in candidates:
-        if p and os.path.isdir(p):
-            return os.path.normpath(p)
+        if not p or not os.path.isdir(p):
+            continue
+        if require_subdir and not os.path.isdir(os.path.join(p, require_subdir)):
+            continue
+        return os.path.normpath(p)
     return os.path.normpath(candidates[0])
 
 
@@ -31,11 +34,14 @@ CKPT_ROOT = first_existing([
     "D:/agent_project/V2U4Real-main/checkpoints",
 ])
 
-ATTACK_ROOT = first_existing([
-    _BUNDLED_ATTACK,
-    "/data/hzy/lxt/AdvCollaborativePerception-master",
-    "D:/agent_project/AdvCollaborativePerception-master",
-])
+ATTACK_ROOT = first_existing(
+    [
+        _BUNDLED_ATTACK,
+        "/data/hzy/lxt/AdvCollaborativePerception-master",
+        "D:/agent_project/AdvCollaborativePerception-master",
+    ],
+    require_subdir=os.path.join("mvp", "data"),
+)
 
 MODEL_CKPTS = {
     "attfuse": os.path.join(CKPT_ROOT, "attfuse_checkpoint"),

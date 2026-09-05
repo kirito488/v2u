@@ -38,9 +38,10 @@ from .gating import CERTAIN, Q_H, Q_L, THETA_P, force_certain_for_gt_id, gate_fr
 from .far_certain import FarCertainTracker, T_FAR, backfill_tentative_to_certain
 from .buffer import CONFIRM, SoftEgoDet, THETA_SOFT, TentativeBuffer
 from .trust_pool import TrustPool
-from .occlusion import visibility_ratio
+from .occlusion import build_polar_depth, visibility_ratio_lidar
 from .paths import EGO_ID, UAV_ID
 from .attack_gt import is_car_oid
+from .uav_fov import box_in_uav_fov
 
 
 @dataclass
@@ -83,9 +84,10 @@ class SourceResult:
         gt_boxes=None,
         gt_ids=None,
         iou_thres=0.3,
+        dist_thres=4.0,
         gate_states=None,
     ) -> List[str]:
-        """One line per box: B, P, C, GT hit, optional §5.1 state."""
+        """One line per box: B, P, C, GT hit (IoU∨d), optional §5.1 state."""
         lines = []
         if self.n == 0:
             return ["  (none)"]
@@ -109,7 +111,11 @@ class SourceResult:
                 iou = float(ious[use])
                 dist = float(dxy[use])
                 gid = gt_ids[use] if gt_ids is not None and use < len(gt_ids) else use
-                tag = "hit" if iou >= float(iou_thres) else "miss"
+                tag = (
+                    "hit"
+                    if (iou >= float(iou_thres) or dist <= float(dist_thres))
+                    else "miss"
+                )
                 extra = "  {} id={} iou={:.2f} dxy={:.1f}m".format(tag, gid, iou, dist)
             n_pts = int(self.point_counts[i]) if i < len(self.point_counts) else -1
             extra_n = "  n={}".format(n_pts) if n_pts >= 0 else ""
@@ -130,8 +136,11 @@ class SourceResult:
         return int(self.boxes.shape[0])
 
 
-def dump_boxes(boxes, ids=None):
-    """Print GT / extra boxes in the same B layout (no P/C)."""
+def dump_boxes(boxes, ids=None, extras=None):
+    """Print GT / extra boxes in the same B layout (no P/C).
+
+    `extras`: optional per-row suffix strings (e.g. soft-ego P/V annotation).
+    """
     boxes = np.asarray(boxes) if boxes is not None else np.zeros((0, 7))
     if boxes.ndim != 2 or boxes.shape[0] == 0:
         return ["  (none)"]
@@ -140,12 +149,82 @@ def dump_boxes(boxes, ids=None):
         tag = ""
         if ids is not None and k < len(ids):
             tag = "  id={}".format(ids[k])
+        extra = ""
+        if extras is not None and k < len(extras) and extras[k]:
+            extra = str(extras[k])
         lines.append(
-            "  #{:<2d}{}  B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]".format(
-                k, tag, b[0], b[1], b[2], b[3], b[4], b[5], b[6]
+            "  #{:<2d}{}  B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]{}".format(
+                k, tag, b[0], b[1], b[2], b[3], b[4], b[5], b[6], extra
             )
         )
     return lines
+
+
+def soft_ego_gt_extras(
+    gt_boxes,
+    gt_ids=None,
+    ego_raw: Optional[SourceResult] = None,
+    p_lo: float = THETA_SOFT,
+    p_hi: float = 0.3,
+    iou_thres: float = 0.3,
+    ego_depth=None,
+) -> List[str]:
+    """Per-GT suffix when a soft-ego det (p_lo ≤ P < p_hi) matches IoU ≥ iou_thres.
+
+    Annotates `` soft-ego P=.. V=.. iou=..``. V from ego LiDAR polar depth when
+    available, else ``V=—``. If several soft dets hit the same GT, keep the
+    highest-IoU one (tie → higher P).
+    """
+    gts = np.asarray(gt_boxes) if gt_boxes is not None else np.zeros((0, 7))
+    n = int(gts.shape[0]) if gts.ndim == 2 else 0
+    extras = [""] * n
+    if n == 0 or ego_raw is None or getattr(ego_raw, "n", 0) <= 0:
+        return extras
+    hi = float(p_hi)
+    lo = float(p_lo)
+    if hi <= lo:
+        return extras
+    band = ego_raw.score_band(lo, hi)
+    if band.n <= 0:
+        return extras
+
+    # best[gt_i] = (iou, p, v)
+    best: Dict[int, Tuple[float, float, float]] = {}
+    for i in range(int(band.n)):
+        b = np.asarray(band.boxes[i], dtype=np.float64)[:7]
+        p = float(band.scores[i])
+        ious = np.array([float(iou_bev(b, g)) for g in gts], dtype=np.float64)
+        j = int(np.argmax(ious))
+        iou = float(ious[j])
+        if iou < float(iou_thres):
+            continue
+        if ego_depth is not None:
+            try:
+                v = float(
+                    visibility_ratio_lidar(
+                        b,
+                        depth=ego_depth,
+                        origin=(0.0, 0.0, 0.0),
+                        check_ego_range=True,
+                        bottom_center=True,
+                    )
+                )
+            except Exception:
+                v = float("nan")
+        else:
+            v = float("nan")
+        prev = best.get(j)
+        if prev is None or iou > prev[0] + 1e-9 or (
+            abs(iou - prev[0]) <= 1e-9 and p > prev[1]
+        ):
+            best[j] = (iou, p, v)
+
+    for j, (iou, p, v) in best.items():
+        if v == v:  # not NaN
+            extras[j] = "  soft-ego P={:.3f} V={:.3f} iou={:.2f}".format(p, v, iou)
+        else:
+            extras[j] = "  soft-ego P={:.3f} V=— iou={:.2f}".format(p, iou)
+    return extras
 
 
 @dataclass
@@ -174,6 +253,7 @@ class FrameThreeSource:
     baseline_info: Optional[Dict[str, Any]] = None
     fusion_z: Optional[Dict[str, Any]] = None  # MADE Z_ego / Z_fused from Init forward
     ego_raw: Optional[SourceResult] = None  # pre-score_thres Ego, for buffer soft band
+    ego_depth: Any = None  # PolarDepthMap for soft-ego V dump (optional)
 
     def summary(self, iou_thres: float = 0.3) -> str:
         """Counts aligned with --verbose dump: Car+range GT, hit dets vs gt_eval."""
@@ -407,8 +487,10 @@ def _concat_boxes(*arrs) -> np.ndarray:
 def _pool_birth_from(gating, buf, gt_lists=None):
     """Confirmed leftover output for §4.3.1.
 
-    Returns (boxes, c_egos, allow_update). allow_update=True only for spatial Certain
-    (KF update on merge); Tentative confirm can birth but not update existing tracks.
+    Returns (boxes, c_egos, allow_update, trajs). allow_update=True only for spatial
+    Certain (KF update on merge); Tentative confirm can birth but not update
+    existing tracks. `trajs[j]` is the watch trajectory for KF birth velocity
+    (ego > fuse), or None.
     Skips GT id=1 (self-car): never enter the trust pool.
     """
     from .gating import FORCE_CERTAIN_GT_ID, box_matches_gt_id
@@ -419,7 +501,7 @@ def _pool_birth_from(gating, buf, gt_lists=None):
                 return True
         return False
 
-    boxes, cs, flags = [], [], []
+    boxes, cs, flags, trajs = [], [], [], []
     for o in getattr(gating, "objects", None) or []:
         if getattr(o, "from_far", False):
             continue
@@ -429,6 +511,10 @@ def _pool_birth_from(gating, buf, gt_lists=None):
             boxes.append(np.asarray(o.box, dtype=np.float64)[:7])
             cs.append(float(o.c_ego))
             flags.append(True)
+            trajs.append(None)
+    # Prefer per-confirm trajs collected this frame (aligned with CONFIRM events).
+    confirm_trajs = list(getattr(buf, "last_confirm_trajs", None) or [])
+    ci = 0
     for e in getattr(buf, "events", None) or []:
         if getattr(e, "decision", None) == CONFIRM and e.box is not None:
             if _is_self(e.box):
@@ -436,9 +522,17 @@ def _pool_birth_from(gating, buf, gt_lists=None):
             boxes.append(np.asarray(e.box, dtype=np.float64)[:7])
             cs.append(float(getattr(e, "c_ego", 0.0) or 0.0))
             flags.append(False)
+            tr = None
+            if ci < len(confirm_trajs):
+                tr = confirm_trajs[ci].get("traj") or confirm_trajs[ci].get("hist")
+            elif getattr(e, "traj", None):
+                # snapshot may omit traj; live confirms list is preferred
+                tr = None
+            trajs.append(list(tr) if tr else None)
+            ci += 1
     if not boxes:
-        return np.zeros((0, 7), dtype=np.float64), [], []
-    return np.stack(boxes), cs, flags
+        return np.zeros((0, 7), dtype=np.float64), [], [], []
+    return np.stack(boxes), cs, flags, trajs
 
 
 def _soft_ego_dets(ego_raw, hard_thres, soft_thres: float = THETA_SOFT):
@@ -458,6 +552,7 @@ def _soft_ego_dets(ego_raw, hard_thres, soft_thres: float = THETA_SOFT):
             SoftEgoDet(
                 box=np.asarray(band.boxes[i], dtype=np.float64)[:7].copy(),
                 q=float(p) * float(c),
+                p=float(p),
             )
         )
     return out
@@ -526,12 +621,14 @@ class ThreeSourceDetector:
     ):
         """§9: gate → far-bypass → pool → leftover §7.
 
-        Pool ATTACK uses a UAV-observation callback (line-of-sight from the UAV
-        LiDAR origin, OR UAV point density at the predicted box), not the
-        ego-origin ray: an ego miss caused by ego occlusion or range should not
+        Pool ATTACK uses a UAV-observation callback (LiDAR polar-depth occlusion
+        from the UAV sensor, OR UAV point density at the predicted box), not the
+        ego-origin box-ray: an ego miss caused by ego occlusion or range should not
         force MISS when the UAV physically sees the object, and a point-erasing
-        attack (early/point-cloud remove) still counts as ATTACK because the
-        geometric line of sight cannot be erased.
+        attack (early/point-cloud remove) still counts as ATTACK when the UAV
+        depth map still has a free line of sight (or leftover points).
+
+        Buffer visibility uses the same polar-depth test from the **ego** LiDAR.
         """
         gating = gate_frame(
             ego,
@@ -546,39 +643,36 @@ class ThreeSourceDetector:
         self.far_tracker.step(gating, frame_id=frame_id)
         gt_lists = ((gt_eval, gt_eval_ids), (gt_ego, gt_ego_ids))
 
-        # UAV LiDAR origin expressed in the ego frame. Ray visibility for the
-        # ATTACK test is measured from here (UAV is rarely occluded); when the
-        # pose is missing we fall back to the ego origin, which only restores
-        # the old behaviour for that degenerate path.
-        uav_origin = None
-        if frame is not None and self.uav_id in frame and self.ego_id in frame:
+        # Per-frame polar depth maps (sensor frames, origin ≈ 0).
+        ego_depth = None
+        uav_depth = None
+        if frame is not None and self.ego_id in frame:
             try:
-                p_uav = frame[self.uav_id].get("lidar_pose")
-                p_ego = frame[self.ego_id].get("lidar_pose")
-                if p_uav is not None and p_ego is not None:
-                    o = _bbox_to_pose(np.zeros(7), p_uav, p_ego)
-                    uav_origin = (float(o[0]), float(o[1]))
+                ego_depth = build_polar_depth(frame[self.ego_id].get("lidar"))
             except Exception:
-                uav_origin = None
+                ego_depth = None
+        if frame is not None and self.uav_id in frame:
+            try:
+                uav_depth = build_polar_depth(frame[self.uav_id].get("lidar"))
+            except Exception:
+                uav_depth = None
+
+        pose_ego = None
+        pose_uav = None
+        if frame is not None and self.uav_id in frame and self.ego_id in frame:
+            pose_ego = frame[self.ego_id].get("lidar_pose")
+            pose_uav = frame[self.uav_id].get("lidar_pose")
 
         def _uav_sight(box, occ=None) -> float:
-            """0..1 UAV-observation strength = max(line-of-sight, density).
+            """0..1 UAV-observation strength for pool ATTACK.
 
-            LOS: BEV rays from the UAV LiDAR origin to the predicted location,
-            blocked only by other pool tracks / extra occluders. Density: C_uav
-            of the predicted location. OR keeps ATTACK valid under both an
-            intermediate attack (points intact, detection erased) and an
-            early/point-cloud remove (points erased, geometry intact).
+            Inside percentile FOV (r / az / el p5–p95 in UAV frame):
+                V = max(LOS_lidar_from_UAV, C_uav)
+            Outside FOV (blind zone; empty depth often spuriously ≈1):
+                V = C_uav only
             """
-            vals = []
-            if uav_origin is not None:
-                try:
-                    b0 = np.asarray(box, dtype=np.float64).reshape(-1)[:7]
-                    vals.append(
-                        visibility_ratio(b0, occluders=occ, origin=uav_origin)
-                    )
-                except Exception:
-                    pass
+            del occ  # box-occluders unused; LiDAR depth replaces them
+            c_uav = 0.0
             try:
                 b = np.asarray(box, dtype=np.float64).reshape(-1)
                 if b.size >= 7 and frame is not None and self.uav_id in frame:
@@ -592,10 +686,54 @@ class ThreeSourceDetector:
                         self.r_min,
                     )
                     if c.size:
-                        vals.append(float(c[0]))
+                        c_uav = float(c[0])
             except Exception:
-                pass
-            return float(np.max(vals)) if vals else 0.0
+                c_uav = 0.0
+
+            in_fov = box_in_uav_fov(
+                box, frame, ego_id=self.ego_id, uav_id=self.uav_id
+            )
+            # Unknown pose → treat as outside FOV (density-only; safer than fake LOS).
+            if in_fov is not True:
+                return float(c_uav)
+
+            los = 0.0
+            if uav_depth is not None and pose_ego is not None and pose_uav is not None:
+                try:
+                    b0 = np.asarray(box, dtype=np.float64).reshape(-1)[:7]
+                    # Detector boxes are bottom-center; lift before ego→uav warp.
+                    b0 = boxes_geometric_center(b0.reshape(1, 7))[0]
+                    b_u = _bbox_to_pose(b0, pose_ego, pose_uav)
+                    los = float(
+                        visibility_ratio_lidar(
+                            b_u,
+                            depth=uav_depth,
+                            origin=(0.0, 0.0, 0.0),
+                            check_ego_range=False,
+                            bottom_center=False,
+                        )
+                    )
+                except Exception:
+                    los = 0.0
+            return float(max(los, c_uav))
+
+        def _ego_vis(box) -> float:
+            """Ego LiDAR polar-depth visibility (buffer ATTACK / evidence)."""
+            if ego_depth is None:
+                return 1.0
+            try:
+                b0 = np.asarray(box, dtype=np.float64).reshape(-1)[:7]
+                return float(
+                    visibility_ratio_lidar(
+                        b0,
+                        depth=ego_depth,
+                        origin=(0.0, 0.0, 0.0),
+                        check_ego_range=True,
+                        bottom_center=True,
+                    )
+                )
+            except Exception:
+                return 0.0
 
         pool = self.trust_pool.step(
             gating,
@@ -606,6 +744,15 @@ class ThreeSourceDetector:
             gt_ids=gt_eval_ids,
             gt_lists=gt_lists,
             uav_sight=_uav_sight if frame is not None else None,
+            birth_traj_hints=[
+                {
+                    "box": np.asarray(e.box, dtype=np.float64)[:7].copy(),
+                    "traj": list(e.velocity_traj()),
+                    "hist": list(e.hist or []),
+                }
+                for e in (self.tent_buffer.entries or [])
+                if e.box is not None
+            ],
         )
         leftover = replace(
             gating,
@@ -618,13 +765,25 @@ class ThreeSourceDetector:
             frame_id=frame_id,
             match_objects=list(gating.objects),
             soft_ego=_soft_ego_dets(ego_raw, self.score_thres),
+            visibility_fn=_ego_vis if ego_depth is not None else None,
+            ego=ego,
+            uav=uav,
+            init=init,
         )
-        birth_boxes, birth_c, birth_upd = _pool_birth_from(
+        birth_boxes, birth_c, birth_upd, birth_trajs = _pool_birth_from(
             leftover,
             buf,
             gt_lists=gt_lists,
         )
-        self.trust_pool.ingest(birth_boxes, birth_c, allow_update=birth_upd)
+        self.trust_pool.ingest(
+            birth_boxes, birth_c, allow_update=birth_upd, trajs=birth_trajs
+        )
+        # Watches that matched Certain this frame: pool may have birthed/updated
+        # before buffer ran — seed vx,vy from the tentative traj if still ~0.
+        self.trust_pool.seed_velocity_from_trajs(
+            list(getattr(buf, "last_certain_trajs", None) or [])
+            + list(getattr(buf, "last_confirm_trajs", None) or [])
+        )
         self.trust_pool.label_living_sources(ego, uav, init)
         full = _concat_boxes(pool.output_boxes, buf.output_boxes)
         self.tent_buffer.prev_output = full
@@ -738,6 +897,12 @@ class ThreeSourceDetector:
             ego_raw=ego_raw,
         )
 
+        ego_depth = None
+        try:
+            ego_depth = build_polar_depth(frame[ego_id].get("lidar"))
+        except Exception:
+            ego_depth = None
+
         return FrameThreeSource(
             frame_id=frame_id,
             ego=ego,
@@ -757,6 +922,7 @@ class ThreeSourceDetector:
             pool=pool,
             fusion_z=fusion_z,
             ego_raw=ego_raw,
+            ego_depth=ego_depth,
         )
 
     def run_case(
