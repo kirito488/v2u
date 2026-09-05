@@ -1,0 +1,271 @@
+"""
+V2U4Real 中间级攻击（单物体/帧） + online=1 时序延续 + 指标评估
+
+说明：
+    - 每个攻击（remove / spoof）在**每一帧只伪造/擦除一个物体**。
+    - ``online=1``：前一帧优化出的扰动作为下一帧的初始化（``init_perturbation``），
+      因此前面帧的攻击会影响后面帧，形成时序上的攻击延续。
+    - 攻击完成后输出评估指标：ASR、目标置信度变化、FP/FN 增长、物体消失率。
+
+用法:
+    python scripts/attack_v2u4real_online.py --model attfuse   --mode remove --iters 20
+    python scripts/attack_v2u4real_online.py --model where2comm --mode spoof  --iters 30
+    python scripts/attack_v2u4real_online.py --model coalign   --mode remove --iters 50
+"""
+import os
+import sys
+import argparse
+
+import numpy as np
+
+
+def _first_existing(candidates):
+    for p in candidates:
+        if p and os.path.isdir(p):
+            return os.path.normpath(p)
+    return os.path.normpath(candidates[0])
+
+
+# 服务器优先，本机路径作后备
+V2U4REAL_ROOT = _first_existing([
+    "/data/hzy/lxt/V2U4Real-main/V2U4Real-main",
+    "/data/hzy/lxt/V2U4Real-main",
+    "D:/agent_project/V2U4Real-main/V2U4Real-main",
+])
+CKPT_ROOT = _first_existing([
+    "/data/hzy/lxt/V2U4Real-main/checkpoints",
+    os.path.join(V2U4REAL_ROOT, "checkpoints"),
+    "D:/agent_project/V2U4Real-main/checkpoints",
+])
+
+root = os.path.normpath(os.path.join(os.path.abspath(os.path.dirname(__file__)), "../"))
+sys.path.insert(0, root)
+sys.path.insert(0, V2U4REAL_ROOT)
+
+from mvp.data.v2u4real_dataset import V2U4RealDataset
+from mvp.perception.opencood_perception import OpencoodPerception
+from mvp.data.util import bbox_sensor_to_map, bbox_map_to_sensor
+from mvp.attack.lidar_spoof_intermediate_attacker import LidarSpoofIntermediateAttacker
+from mvp.attack.lidar_remove_intermediate_attacker import LidarRemoveIntermediateAttacker
+from mvp.attack.donor_selector import select_attack_positions
+from mvp.evaluate.attack_metrics import (
+    evaluate_spoof, evaluate_remove, print_spoof_report, print_remove_report,
+)
+
+MODEL_CKPTS = {
+    "attfuse":    os.path.join(CKPT_ROOT, "attfuse_checkpoint"),
+    "where2comm": os.path.join(CKPT_ROOT, "where2comm_checkpoint"),
+    "coalign":    os.path.join(CKPT_ROOT, "coalign_checkpoint"),
+}
+
+
+def load_model(name):
+    return OpencoodPerception(
+        fusion_method="intermediate",
+        model_name=name,
+        model_dir=MODEL_CKPTS[name],
+        opencood_root=V2U4REAL_ROOT,
+        root_dir=os.path.join(V2U4REAL_ROOT, "v2u4real", "train"),
+        validate_dir=os.path.join(V2U4REAL_ROOT, "v2u4real", "val"),
+    )
+
+
+def run_clean(perception, multi_frame_case, frame_ids, ego_id):
+    clean = []
+    gt_list = []
+    for f in frame_ids:
+        frame = multi_frame_case[f]
+        pb, ps = perception.run(frame, ego_id)
+        clean.append((pb, ps))
+        gt_list.append(frame[ego_id]["gt_bboxes"])
+    return clean, gt_list
+
+
+def run_spoof_online(perception, dataset, multi_frame_case, frame_ids, ego_id, att_id, iters):
+    # 1. Ghost position: a blind/danger spot in the ego frame (single object).
+    ego_frame0 = multi_frame_case[frame_ids[0]][ego_id]
+    pos, _ = select_attack_positions(
+        ego_frame0["lidar"], ego_frame0["gt_bboxes"], 1, np.random.RandomState(0))
+    fx, fy = pos[0][0], pos[0][1]
+    bbox_ego = np.array([fx, fy, 0, 4.7, 1.9, 1.7, 0], dtype=np.float64)
+    print("[spoof] 幽灵目标 ego 位置 ({:.1f}, {:.1f})".format(fx, fy))
+
+    # 2. Convert the ghost bbox to the attacker frame for every frame (positions).
+    positions = []
+    for f in range(len(multi_frame_case)):
+        frame = multi_frame_case[f]
+        bbox_world = bbox_sensor_to_map(bbox_ego, frame[ego_id]["lidar_pose"])
+        bbox_att = bbox_map_to_sensor(bbox_world, frame[att_id]["lidar_pose"])
+        positions.append(bbox_att)
+
+    # 3. Online attack (single object / frame, temporal perturbation carry-over).
+    attacker = LidarSpoofIntermediateAttacker(
+        perception, dataset, step=iters, sync=0, init=False, online=True)
+    _, info = attacker.run(multi_frame_case, {
+        "frame_ids": frame_ids,
+        "attacker_vehicle_id": att_id,
+        "victim_vehicle_id": ego_id,
+        "positions": positions,
+        "attack_info": [{} for _ in range(len(multi_frame_case))],
+    })
+    attacked = [(info[f][ego_id]["pred_bboxes"], info[f][ego_id]["pred_scores"])
+                for f in frame_ids]
+    return attacked, [bbox_ego] * len(frame_ids)
+
+
+def _transform_bbox(bbox, pose_from, pose_to):
+    """把 [x,y,z,l,w,h,yaw] 从 pose_from 的雷达系转到 pose_to 的雷达系。"""
+    world = bbox_sensor_to_map(np.asarray(bbox, dtype=np.float64), pose_from)
+    return bbox_map_to_sensor(world, pose_to)
+
+
+def _select_remove_target(clean0_boxes, clean0_scores, frame0, ego_id, att_id):
+    """优先选：ego 检测得到、且无人机 GT 转到 ego 后距离 < 8m 的目标（UAV 看得到才能扰动特征）。
+    否则退化为「距 ego 3–50m、置信度最高」的检测，保证 proposal IoU > 0、loss 非 0。
+    """
+    ego0 = frame0[ego_id]
+    att0 = frame0[att_id]
+    att_in_ego = []
+    for b in att0["gt_bboxes"]:
+        att_in_ego.append(_transform_bbox(b, att0["lidar_pose"], ego0["lidar_pose"]))
+    att_in_ego = np.array(att_in_ego) if len(att_in_ego) else np.zeros((0, 7))
+
+    order = np.argsort(-np.asarray(clean0_scores).reshape(-1))
+    uav_hit = None
+    fallback = None
+    for i in order:
+        box = clean0_boxes[i]
+        dist = float(np.hypot(box[0], box[1]))
+        if dist < 3.0 or dist > 50.0:
+            continue
+        if float(clean0_scores[i]) < 0.3:
+            continue
+        if fallback is None:
+            fallback = i
+        if att_in_ego.shape[0] > 0:
+            dmin = np.min(np.hypot(att_in_ego[:, 0] - box[0], att_in_ego[:, 1] - box[1]))
+            if dmin < 8.0:
+                uav_hit = i
+                break
+    pick = uav_hit if uav_hit is not None else fallback
+    if pick is None:
+        pick = int(order[0])
+    src = "uav-visible" if uav_hit is not None else "ego-det-fallback"
+    return clean0_boxes[pick], float(clean0_scores[pick]), src
+
+
+def run_remove_online(perception, dataset, multi_frame_case, frame_ids, ego_id, att_id, iters, clean=None):
+    # 目标必须在 ego 检测坐标系（±检测范围），否则与 proposal 无 IoU → loss 恒 0。
+    if clean is None or len(clean) == 0 or len(clean[0][0]) == 0:
+        print("[remove] 模型第一帧无检测，无法选目标")
+        return None, None
+    clean0_boxes, clean0_scores = clean[0][0], clean[0][1]
+    ego_box0, score0, src = _select_remove_target(
+        clean0_boxes, clean0_scores, multi_frame_case[frame_ids[0]], ego_id, att_id)
+    print("[remove] 目标来源={}, 置信度={:.3f}, ego系框={}".format(
+        src, score0, np.round(ego_box0, 1)))
+    if score0 < 0.3:
+        print("[remove] 警告：选中目标干净置信度 < 0.3，ASR 会把该帧标成无效")
+
+    # 按帧跟踪：用位姿预测位置，并吸附到该帧干净检测（score>=0.3、15m 内）。
+    # 冻结第 0 帧世界坐标会把运动目标跟丢，后面帧干净置信度全是 0，ASR 无意义。
+    ego0 = multi_frame_case[frame_ids[0]][ego_id]
+    world_tgt = bbox_sensor_to_map(np.asarray(ego_box0, dtype=np.float64), ego0["lidar_pose"])
+    target_att, target_ego = [], []
+    for fi, f in enumerate(frame_ids):
+        att = multi_frame_case[f][att_id]
+        ego = multi_frame_case[f][ego_id]
+        pred_ego = bbox_map_to_sensor(world_tgt, ego["lidar_pose"])
+        boxes, scores = clean[fi]
+        snapped = False
+        dmin = float("nan")
+        if boxes is not None and len(boxes) > 0:
+            boxes = np.asarray(boxes)
+            scores = np.asarray(scores).reshape(-1)
+            dist = np.hypot(boxes[:, 0] - pred_ego[0], boxes[:, 1] - pred_ego[1])
+            cand = [j for j in range(len(boxes)) if scores[j] >= 0.3]
+            if cand:
+                j = min(cand, key=lambda k: dist[k])
+                dmin = float(dist[j])
+                if dmin <= 15.0:
+                    pred_ego = boxes[j]
+                    world_tgt = bbox_sensor_to_map(
+                        np.asarray(pred_ego, dtype=np.float64), ego["lidar_pose"])
+                    snapped = True
+        print("[remove] frame {} snap={} dist={:.1f}m ego_xy=({:.1f},{:.1f})".format(
+            f, snapped, dmin if dmin == dmin else -1.0, pred_ego[0], pred_ego[1]))
+        target_ego.append(np.asarray(pred_ego, dtype=np.float64))
+        target_att.append(_transform_bbox(pred_ego, ego["lidar_pose"], att["lidar_pose"]))
+
+    # 3. Online attack（不传 object_id，攻击器内部 fallback 用 bboxes）。
+    attacker = LidarRemoveIntermediateAttacker(
+        perception, dataset, step=iters, sync=0, init=False, online=True)
+    _, info = attacker.run(multi_frame_case, {
+        "frame_ids": frame_ids,
+        "attacker_vehicle_id": att_id,
+        "victim_vehicle_id": ego_id,
+        "bboxes": target_att,
+        "attack_info": [{} for _ in range(len(multi_frame_case))],
+    })
+    attacked = [(info[f][ego_id]["pred_bboxes"], info[f][ego_id]["pred_scores"])
+                for f in frame_ids]
+    return attacked, target_ego
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=list(MODEL_CKPTS.keys()), default="attfuse")
+    parser.add_argument("--mode", choices=["remove", "spoof"], default="remove")
+    parser.add_argument("--case", type=int, default=0)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--data", default=os.path.join(V2U4REAL_ROOT, "v2u4real"))
+    args = parser.parse_args()
+
+    ego_id, att_id = "1", "2"
+    frame_ids = list(range(10))
+
+    dataset = V2U4RealDataset(root_path=os.path.join(args.data, "val"), mode="val")
+    print("[1/4] 加载数据，multi_frame case 数 =", dataset.case_number("multi_frame"))
+    perception = load_model(args.model)
+    print("[2/4] 加载模型:", args.model)
+
+    print("运行 {} 攻击（online=1, {} 迭代）...".format(args.mode, args.iters))
+    if args.mode == "spoof":
+        multi_frame_case = dataset.get_case(args.case, tag="multi_frame")
+        meta = dataset.cases["multi_frame"][args.case]
+        print("[3/4] 场景 =", meta["scenario_name"])
+        print("运行 clean 基线 ...")
+        clean, gt_list = run_clean(perception, multi_frame_case, frame_ids, ego_id)
+        attacked, injected = run_spoof_online(
+            perception, dataset, multi_frame_case, frame_ids, ego_id, att_id, args.iters)
+        report = evaluate_spoof(clean, attacked, gt_list, injected)
+        print_spoof_report(report)
+    else:
+        # remove: 自动找一个有"模型可检测目标"的 case（V2U4Real 很多场景车辆超出检测范围）
+        case = args.case
+        attacked = target_ego = None
+        clean = gt_list = None
+        for _ in range(20):
+            multi_frame_case = dataset.get_case(case, tag="multi_frame")
+            meta = dataset.cases["multi_frame"][case]
+            print("[3/4] 场景 =", meta["scenario_name"])
+            print("运行 clean 基线 ...")
+            clean, gt_list = run_clean(perception, multi_frame_case, frame_ids, ego_id)
+            attacked, target_ego = run_remove_online(
+                perception, dataset, multi_frame_case, frame_ids, ego_id, att_id,
+                args.iters, clean=clean)
+            if attacked is not None:
+                break
+            print("  case {} 无可用目标，尝试 case {} ...".format(case, case + 1))
+            case += 1
+        if attacked is None:
+            print("20 个 case 都无模型可检测目标，放弃。")
+            return
+        report = evaluate_remove(clean, attacked, gt_list, target_ego)
+        print_remove_report(report)
+
+    print("[4/4] 完成")
+
+
+if __name__ == "__main__":
+    main()

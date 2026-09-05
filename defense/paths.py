@@ -1,8 +1,12 @@
-"""Resolve V2U4Real / attack-repo paths (Linux first, then local Windows)."""
+"""Resolve V2U4Real / attack-repo paths (bundled monorepo first, then absolute)."""
 from __future__ import annotations
 
 import os
 import sys
+
+_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+_BUNDLED_V2U4 = os.path.join(_REPO_ROOT, "V2U4Real")
+_BUNDLED_ATTACK = os.path.join(_REPO_ROOT, "AdvCollaborativePerception")
 
 
 def first_existing(candidates):
@@ -13,6 +17,7 @@ def first_existing(candidates):
 
 
 V2U4REAL_ROOT = first_existing([
+    _BUNDLED_V2U4,
     "/data/hzy/lxt/V2U4Real-main/V2U4Real-main",
     "/data/hzy/lxt/V2U4Real-main",
     "D:/agent_project/V2U4Real-main/V2U4Real-main",
@@ -20,12 +25,14 @@ V2U4REAL_ROOT = first_existing([
 ])
 
 CKPT_ROOT = first_existing([
+    os.path.join(_BUNDLED_V2U4, "checkpoints"),
     "/data/hzy/lxt/V2U4Real-main/checkpoints",
     os.path.join(V2U4REAL_ROOT, "checkpoints"),
     "D:/agent_project/V2U4Real-main/checkpoints",
 ])
 
 ATTACK_ROOT = first_existing([
+    _BUNDLED_ATTACK,
     "/data/hzy/lxt/AdvCollaborativePerception-master",
     "D:/agent_project/AdvCollaborativePerception-master",
 ])
@@ -38,6 +45,7 @@ MODEL_CKPTS = {
 
 # Single-agent late PointPillars (vehicle / UAV), trained with only_cav_id 1 / 2.
 _OPENCOOD_LOGS = first_existing([
+    os.path.join(_BUNDLED_V2U4, "opencood", "logs"),
     "/data/hzy/lxt/V2U4Real-main/opencood/logs",
     os.path.join(V2U4REAL_ROOT, "opencood", "logs"),
     os.path.join(os.path.dirname(V2U4REAL_ROOT), "opencood", "logs"),
@@ -65,6 +73,7 @@ def val_dir():
     for p in (
         os.path.join(V2U4REAL_ROOT, "v2u4real", "val"),
         os.path.join(os.path.dirname(V2U4REAL_ROOT), "v2u4real", "val"),
+        "/data/hzy/lxt/V2U4Real-main/v2u4real/val",
         "D:/agent_project/V2U4Real-main/v2u4real/val",
     ):
         if os.path.isdir(p):
@@ -76,6 +85,7 @@ def train_dir():
     for p in (
         os.path.join(V2U4REAL_ROOT, "v2u4real", "train"),
         os.path.join(os.path.dirname(V2U4REAL_ROOT), "v2u4real", "train"),
+        "/data/hzy/lxt/V2U4Real-main/v2u4real/train",
         "D:/agent_project/V2U4Real-main/v2u4real/train",
     ):
         if os.path.isdir(p):

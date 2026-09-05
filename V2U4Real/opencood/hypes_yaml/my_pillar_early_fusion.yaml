@@ -1,0 +1,128 @@
+# ============================================================
+# MyPillar 模型的配置文件
+# 用于 V2U4Real 数据集的 early fusion 训练和测试
+# ============================================================
+
+name: my_pillar_early_fusion          # 模型名称（用于创建 log 目录）
+
+# ---- 数据路径 ----
+root_dir: "v2u4real/train"           # 训练集路径
+validate_dir: "v2u4real/val"         # 验证集路径（测试时改为 test 路径）
+lidar_type: 'ouster'                 # 使用 OS-128 LiDAR
+
+# ---- YAML 解析器 ----
+# load_point_pillar_params 会自动根据 voxel_size 和 lidar_range
+# 计算 grid_size、anchor 尺寸等参数
+yaml_parser: "load_point_pillar_params"
+
+# ---- 噪声/异步设定 ----
+wild_setting:
+  seed: 20
+  async: false                       # 是否模拟通信延迟
+  async_mode: 'real'
+  async_overhead: 100
+  loc_err: False
+  xyz_std: 0.2
+  ryp_std: 0.2
+  data_size: 1.06
+  transmission_speed: 27
+  backbone_delay: 10
+
+# ---- 训练参数 ----
+train_params:
+  batch_size: &batch_size 4
+  epoches: 40
+  eval_freq: 1                       # 每 1 个 epoch 评估一次
+  save_freq: 1                       # 每 1 个 epoch 保存一次
+
+# ---- 融合策略 ----
+fusion:
+  core_method: 'EarlyFusionDataset'  # 使用 early fusion 数据集
+  args: []
+
+# ---- 数据预处理 ----
+preprocess:
+  core_method: 'SpVoxelPreprocessor' # 体素化预处理
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 8]   # 体素尺寸 (x, y, z) 米
+    max_points_per_voxel: 32                  # 每个体素最多采样点数
+    max_voxel_train: 32000                    # 训练时最大体素数
+    max_voxel_test: 70000                     # 测试时最大体素数
+  cav_lidar_range: &cav_lidar [-100.8, -80, -4, 100.8, 80, 4]  # LiDAR 范围
+
+# ---- 数据增强 ----
+data_augment:
+  - NAME: random_world_flip
+    ALONG_AXIS_LIST: ['x']
+
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]  # ±45度
+
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE: [0.95, 1.05]
+
+# ---- 后处理（anchor 生成 + NMS） ----
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9                             # anchor 长度 (米)
+    w: 1.6                             # anchor 宽度 (米)
+    h: 1.56                            # anchor 高度 (米)
+    r: [0, 90]                         # anchor 朝向 (度)
+    num: &anchor_num 2                 # 每个位置 2 个 anchor
+  target_args:
+    pos_threshold: 0.6                 # 正样本 IoU 阈值
+    neg_threshold: 0.45                # 负样本 IoU 阈值
+    score_threshold: 0.20              # 推理时分数阈值
+  order: 'hwl'                         # box 参数顺序: height, width, length
+  max_num: 100                         # 每帧最多目标数
+  nms_thresh: 0.15                     # NMS IoU 阈值
+
+# ---- 模型定义 ----
+model:
+  core_method: my_pillar             # ★ 关键：对应 opencood/models/my_pillar.py 中的 MyPillar 类
+  args:
+    voxel_size: *voxel_size
+    lidar_range: *cav_lidar
+    anchor_number: *anchor_num
+
+    # Pillar VFE 参数
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_filters: [64]
+
+    # Scatter 参数（grid_size 由 yaml_parser 自动计算）
+    point_pillar_scatter:
+      num_features: 64
+
+    # BEV Backbone 参数
+    base_bev_backbone:
+      layer_nums: [3, 5, 8]          # 3 个 stage 的层数
+      layer_strides: [2, 2, 2]       # 每个 stage 的 stride
+      num_filters: [64, 128, 256]    # 每个 stage 的通道数
+      upsample_strides: [1, 2, 4]    # 上采样 stride
+      num_upsample_filter: [128, 128, 128]  # 上采样后通道数
+
+# ---- 损失函数 ----
+loss:
+  core_method: point_pillar_loss      # 使用 PointPillar 的 loss
+  args:
+    cls_weight: 1.0                   # 分类 loss 权重
+    reg: 2.0                          # 回归 loss 权重
+
+# ---- 优化器 ----
+optimizer:
+  core_method: Adam
+  lr: 0.002
+  args:
+    eps: 1e-10
+    weight_decay: 1e-2
+
+# ---- 学习率调度 ----
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [20, 30]                # epoch 20 和 30 时 lr × 0.1

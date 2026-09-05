@@ -1,0 +1,120 @@
+# ============================================================
+# MyLLMDetector 配置文件
+# LLM + LoRA 做 3D 检测
+# ============================================================
+
+name: my_llm_detector
+
+# ---- 数据路径 ----
+root_dir: "v2u4real/train"
+validate_dir: "v2u4real/val"
+lidar_type: 'ouster'
+
+yaml_parser: "load_point_pillar_params"
+
+# ---- 训练参数 ----
+train_params:
+  batch_size: &batch_size 1          # ★ LLM 吃显存，batch_size 只能 1
+  epoches: 20
+  eval_freq: 1
+  save_freq: 1
+  max_cav: &max_cav 5
+
+# ---- 融合策略 ----
+fusion:
+  core_method: 'IntermediateFusionDataset'
+  args:
+    proj_first: true
+
+# ---- 噪声设定 ----
+wild_setting:
+  seed: 20
+  async: false
+  async_mode: 'real'
+  async_overhead: 100
+  loc_err: False
+  xyz_std: 0.2
+  ryp_std: 0.2
+  data_size: 1.06
+  transmission_speed: 27
+  backbone_delay: 10
+
+# ---- 数据预处理 ----
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 8]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &cav_lidar [-100.8, -80, -4, 100.8, 80, 4]
+
+# ---- 数据增强 ----
+data_augment:
+  - NAME: random_world_flip
+    ALONG_AXIS_LIST: ['x']
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE: [-0.78539816, 0.78539816]
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE: [0.95, 1.05]
+
+# ---- 后处理 ----
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    num: &anchor_num 2
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.20
+  order: 'hwl'
+  max_num: 100
+  nms_thresh: 0.15
+
+# ---- ★ 模型：LLM 检测器 ----
+model:
+  core_method: my_llm_detector
+  args:
+    voxel_size: *voxel_size
+    lidar_range: *cav_lidar
+    anchor_number: *anchor_num
+    max_cav: *max_cav
+
+    # ★ LLM 配置 ★
+    llm_model_name: 'Qwen/Qwen2.5-1.5B'    # 换模型改这里就行
+    llm_hidden_dim: 1536                    # Qwen2.5-1.5B 的隐藏维度
+
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_filters: [64]
+
+    point_pillar_scatter:
+      num_features: 64
+
+# ---- 损失函数 ----
+loss:
+  core_method: point_pillar_loss
+  args:
+    cls_weight: 1.0
+    reg: 2.0
+
+# ---- 优化器（学习率要小，因为 LLM 已有预训练知识）----
+optimizer:
+  core_method: Adam
+  lr: 0.0001                           # ★ LLM 微调用小学习率
+  args:
+    eps: 1e-10
+    weight_decay: 1e-4
+
+# ---- 学习率调度 ----
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.5                            # 衰减缓一点
+  step_size: [10, 15]

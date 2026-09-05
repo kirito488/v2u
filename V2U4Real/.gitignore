@@ -1,0 +1,26 @@
+**__pycache__**
+**build**
+**egg-info**
+**dist**
+data/
+*.pyc
+venv/
+*.idea/
+*.so
+*.sh
+# *.pth  # allow vendored ckpts in monorepo
+*.pkl
+*.zip
+*.bin
+output
+opencood/utils/box_overlaps.cpython-37m-x86_64-linux-gnu.so
+opencood/utils/box_overlaps.c
+# opencood/logs/  # allow vendored ckpts in monorepo
+
+# Monorepo: keep fusion + late PointPillar checkpoints
+!checkpoints/**/*.pth
+!opencood/logs/
+!opencood/logs/point_pillar_vehicle_only_2026_08_26_17_26_19/
+!opencood/logs/point_pillar_vehicle_only_2026_08_26_17_26_19/**
+!opencood/logs/point_pillar_uav_only_2026_08_27_00_38_53/
+!opencood/logs/point_pillar_uav_only_2026_08_27_00_38_53/**
