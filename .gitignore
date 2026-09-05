@@ -1,0 +1,17 @@
+logs/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+*.pt
+*.pth
+*.npy
+*.npz
+*.npz-*
+out.json
+CUDA_VISIBLE_DEVICES=*
+.DS_Store
+1
+*.bak*
+docs/scheme/
