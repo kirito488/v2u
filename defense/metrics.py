@@ -412,17 +412,21 @@ def target_matched(
     iou_thres: float = 0.3,
     dist_thres: float = 4.0,
 ) -> bool:
-    """True if any box matches target by BEV IoU≥θ_iou OR center dxy≤θ_d."""
+    """True if any box matches target by BEV IoU≥θ_iou OR (optional) center dxy≤θ_d.
+
+    Set dist_thres<=0 to disable the distance fallback (IoU-only ASR).
+    """
     if target is None:
         return False
     boxes = _as_boxes7(boxes)
     t = np.asarray(target, dtype=np.float64).reshape(-1)[:7]
     if boxes.shape[0] == 0:
         return False
+    use_dist = float(dist_thres) > 0.0
     for b in boxes:
         if float(iou_bev(b, t)) >= float(iou_thres):
             return True
-        if float(np.hypot(b[0] - t[0], b[1] - t[1])) <= float(dist_thres):
+        if use_dist and float(np.hypot(b[0] - t[0], b[1] - t[1])) <= float(dist_thres):
             return True
     return False
 
@@ -631,11 +635,18 @@ def print_attack_miss(
     n = st["n_attack"]
     nt = st["n_targets"]
     is_spoof = st["mode"] in SPOOF_MODES
-    print(
-        "\n=== Attack miss (IoU>={:.2f} OR dxy≤{:.1f}m, per-frame targets) ===".format(
-            float(iou_thres), float(dist_thres)
+    if float(dist_thres) > 0:
+        print(
+            "\n=== Attack miss (IoU>={:.2f} OR dxy≤{:.1f}m, per-frame targets) ===".format(
+                float(iou_thres), float(dist_thres)
+            )
         )
-    )
+    else:
+        print(
+            "\n=== Attack miss (IoU>={:.2f} only, per-frame targets) ===".format(
+                float(iou_thres)
+            )
+        )
     print(
         "mode={}  attack_frames={}  target_instances={}".format(
             st["mode"], n, nt

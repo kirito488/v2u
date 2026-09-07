@@ -485,20 +485,56 @@ def main():
     ap.add_argument(
         "--n_ref",
         type=float,
-        default=40.0,
-        help="Ego n_ref for C_abs (scheme n_ref^ego=40)",
+        default=None,
+        help="Ego n_ref for C_abs (default: confidence.N_REF_EGO)",
     )
     ap.add_argument(
         "--n_ref_uav",
         type=float,
-        default=25.0,
-        help="UAV n_ref for C_abs (scheme n_ref^uav=25; top-view)",
+        default=None,
+        help="UAV n_ref for C_abs (default: confidence.N_REF_UAV)",
+    )
+    ap.add_argument(
+        "--r0",
+        type=float,
+        default=None,
+        help="Ego reference range r0 for n_exp (default: confidence.R0_EGO)",
+    )
+    ap.add_argument(
+        "--r0_uav",
+        type=float,
+        default=None,
+        help="UAV reference range r0 (default: --r0 or confidence.R0_UAV)",
+    )
+    ap.add_argument(
+        "--a_ref_ego",
+        type=float,
+        default=None,
+        help="Ego A_ref (m^2); default from confidence.area_ref",
+    )
+    ap.add_argument(
+        "--a_ref_uav",
+        type=float,
+        default=None,
+        help="UAV A_ref (m^2); default from confidence.area_ref",
+    )
+    ap.add_argument(
+        "--calib_json",
+        type=str,
+        default=None,
+        help="Apply ego/uav n_ref,r0,A_ref from scripts/calibrate_confidence.py output",
     )
     ap.add_argument(
         "--iou_thres",
         type=float,
         default=0.3,
         help="BEV IoU vs GT for hit (SYSTEM_DESIGN θ_iou=0.3)",
+    )
+    ap.add_argument(
+        "--asr_dist_thres",
+        type=float,
+        default=0.0,
+        help="ASR match distance fallback (m); 0=IoU-only (aligned with nolate reports)",
     )
     ap.add_argument(
         "--q_h",
@@ -626,6 +662,60 @@ def main():
 
     need_attack = args.mode not in (None, "none", "")
     defer_late = need_attack and args.level in ("intermediate", "late")
+
+    # Optional C calibration (n_ref / r0 / A_ref)
+    from defense.confidence import (
+        N_REF_EGO,
+        N_REF_UAV,
+        R0 as _R0_DEF,
+        R0_EGO,
+        R0_UAV,
+        A_REF_EGO,
+        A_REF_UAV,
+        apply_calibration,
+    )
+
+    if args.calib_json:
+        with open(args.calib_json, "r", encoding="utf-8") as f:
+            calib = json.load(f)
+        ego_c = calib.get("ego") or {}
+        uav_c = calib.get("uav") or {}
+        if ego_c.get("n_ref") is not None:
+            args.n_ref = float(ego_c["n_ref"])
+        if uav_c.get("n_ref") is not None:
+            args.n_ref_uav = float(uav_c["n_ref"])
+        if ego_c.get("r0") is not None:
+            args.r0 = float(ego_c["r0"])
+        if uav_c.get("r0") is not None:
+            args.r0_uav = float(uav_c["r0"])
+        if ego_c.get("A_ref") is not None:
+            args.a_ref_ego = float(ego_c["A_ref"])
+        if uav_c.get("A_ref") is not None:
+            args.a_ref_uav = float(uav_c["A_ref"])
+        print("[calib] loaded", args.calib_json, flush=True)
+
+    if args.n_ref is None:
+        args.n_ref = float(N_REF_EGO)
+    if args.n_ref_uav is None:
+        args.n_ref_uav = float(N_REF_UAV)
+    if args.r0 is None:
+        args.r0 = float(R0_EGO if R0_EGO is not None else _R0_DEF)
+    if args.r0_uav is None:
+        args.r0_uav = float(R0_UAV if R0_UAV is not None else args.r0)
+    if args.a_ref_ego is None and A_REF_EGO is not None:
+        args.a_ref_ego = float(A_REF_EGO)
+    if args.a_ref_uav is None and A_REF_UAV is not None:
+        args.a_ref_uav = float(A_REF_UAV)
+    applied = apply_calibration(
+        n_ref_ego=args.n_ref,
+        n_ref_uav=args.n_ref_uav,
+        r0_ego=args.r0,
+        r0_uav=args.r0_uav,
+        a_ref_ego=args.a_ref_ego,
+        a_ref_uav=args.a_ref_uav,
+    )
+    print("[calib] C params =", applied, flush=True)
+
     print("[load] loading fusion model ({}) ...".format(args.model), flush=True)
     perception = load_fusion_model(args.model)
     ego_perception = None
@@ -646,6 +736,8 @@ def main():
         uav_id=UAV_ID,
         n_ref=args.n_ref,
         n_ref_uav=args.n_ref_uav,
+        r0=args.r0,
+        r0_uav=args.r0_uav,
         score_thres=args.score_thres,
         theta_p=args.theta_p,
         q_h=args.q_h,
@@ -660,6 +752,10 @@ def main():
         "  iou_thres =", args.iou_thres,
         "  n_ref_ego =", args.n_ref,
         "  n_ref_uav =", args.n_ref_uav,
+        "  r0 =", args.r0,
+        "  r0_uav =", args.r0_uav,
+        "  a_ref_ego =", args.a_ref_ego,
+        "  a_ref_uav =", args.a_ref_uav,
         "  q_h =", args.q_h,
         "  q_l =", args.q_l,
         "  mode =", args.mode,
@@ -936,7 +1032,12 @@ def main():
 
     print_metrics_table(all_frames)
     print_defense_metrics(all_frames)
-    attack_miss = print_attack_miss(all_frames, args.mode, iou_thres=args.iou_thres)
+    attack_miss = print_attack_miss(
+        all_frames,
+        args.mode,
+        iou_thres=args.iou_thres,
+        dist_thres=args.asr_dist_thres,
+    )
     print_source_overlap(all_frames, iou_thres=args.iou_thres)
 
     compare_rows = None
@@ -956,6 +1057,11 @@ def main():
             "theta_p": args.theta_p,
             "n_ref": args.n_ref,
             "n_ref_uav": args.n_ref_uav,
+            "r0": args.r0,
+            "r0_uav": args.r0_uav,
+            "a_ref_ego": args.a_ref_ego,
+            "a_ref_uav": args.a_ref_uav,
+            "calib_json": args.calib_json,
             "q_h": args.q_h,
             "q_l": args.q_l,
             "mode": args.mode,
@@ -964,7 +1070,9 @@ def main():
             "defense": args.defense,
             "defense_metrics": evaluate_defense(all_frames),
             "accepted_metrics": evaluate_accepted(all_frames),
-            "attack_miss": attack_miss if isinstance(attack_miss, dict) else evaluate_attack_miss(all_frames, args.mode, args.iou_thres),
+            "attack_miss": attack_miss if isinstance(attack_miss, dict) else evaluate_attack_miss(
+                all_frames, args.mode, args.iou_thres, dist_thres=args.asr_dist_thres
+            ),
             "compare": compare_rows,
             "frames": results_to_dict(all_frames),
         }
@@ -1032,7 +1140,9 @@ def _print_defense_compare(frames, lidars, args):
         packs.append((name, _replay_frames(frames, lidars, name, args)))
     for name, frs in packs:
         drows = evaluate_accepted(frs)
-        miss = evaluate_attack_miss(frs, args.mode, iou_thres=args.iou_thres)
+        miss = evaluate_attack_miss(
+            frs, args.mode, iou_thres=args.iou_thres, dist_thres=args.asr_dist_thres
+        )
         rec = {
             "defense": name,
             "ap025": _ap_at(drows, 0.25),

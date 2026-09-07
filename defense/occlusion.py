@@ -18,22 +18,42 @@ import numpy as np
 
 from .metrics import lidar_range_mask
 
+# Visibility threshold: ≥2 of 8 box corners free (common 8-corner visibility
+# convention; cf. monocular/LiDAR bbox-corner visibility literature).
 V_MIN = 0.25
 K_ATK = 10
+# Range slack when comparing polar returns to near-face cutoff (metres).
+# Ouster range resolution is cm-scale; 0.3 m absorbs calibration / motion blur.
 _HIT_EPS = 0.3
 
+# ---------------------------------------------------------------------------
 # Polar depth map defaults (sensor frame).
-AZ_RES_DEG = 0.5
-EL_RES_DEG = 1.0
-# Ignore returns closer than this to the target sample (self / same-object points).
-CLEAR_DIST_M = 2.0
-# Neighbour bins checked around the sample's (az, el).
+# Previously AZ=0.5° / EL=1.0° / 5×5×3 grid were engineering guesses.
+# Values below follow published spherical occlusion discretisation + V2U4Real
+# sensor (config: lidar_type='ouster').
+#
+# Angular bins — BtcDet (Xu et al., AAAI 2022 / arXiv:2112.02205) uses
+# spherical voxels for LiDAR occlusion; KITTI setting (φ, θ) = (0.52°, 0.42°).
+# (WOD setting 0.81°/0.31° is coarser in azimuth; we take KITTI as default.)
+# Closest Ouster OS1 physical spacings for reference:
+#   az ≈ 360°/1024 ≈ 0.35° (common 1024 mode), el ≈ 42.4°/63 ≈ 0.67° (64 ch).
+# ---------------------------------------------------------------------------
+AZ_RES_DEG = 0.52
+EL_RES_DEG = 0.42
+# Fallback self-clear distance when OBB entry fails (metres).
+# Ouster OS1 default minimum range is 0.5 m (datasheet); half-BEV-diagonal
+# still applied in `_clear_dist_for_box` so large vehicles get a larger margin.
+CLEAR_DIST_M = 0.5
+# Neighbour bins (±nb) to reduce polar discretisation holes (same spirit as
+# OctoMap / WYSIWYG raycasting aggregation robustness).
 POLAR_NB = 1
-# Dense sample grid on the query box (length × width × height).
-# Was center+4 corners (5 rays); now a full OBB grid for stabler V.
-SAMPLE_L = 5
-SAMPLE_W = 5
-SAMPLE_H = 3
+# Query-box ray samples. Literature default = 8 OBB corners
+# (e.g. bbox-corner visibility / occlusion checks). Dense L×W×H grids were
+# ad-hoc; kept as optional SAMPLE_MODE="grid" for ablation.
+SAMPLE_MODE = "corners8"  # "corners8" | "grid"
+SAMPLE_L = 2  # only used when SAMPLE_MODE == "grid"
+SAMPLE_W = 2
+SAMPLE_H = 2
 
 
 def _as_boxes(boxes) -> np.ndarray:
@@ -55,33 +75,48 @@ def _sample_points_3d(
     n_l: int = SAMPLE_L,
     n_w: int = SAMPLE_W,
     n_h: int = SAMPLE_H,
+    mode: Optional[str] = None,
 ) -> np.ndarray:
-    """Grid samples inside the OBB (sensor / ego frame).
+    """Sample points on/in the OBB (sensor / ego frame).
 
-    Uniform grid along length / width / height in the box local frame,
-    then rotated by yaw. Includes faces and interior (center).
-    Default: 5×5×3 = 45 rays (vs old center+4 corners = 5).
+    Default ``corners8``: the 8 geometric corners (standard bbox-corner
+    visibility probes). ``grid``: uniform L×W×H lattice (ablation only).
     """
     b = np.asarray(box, dtype=np.float64).reshape(-1)
     x, y, z = float(b[0]), float(b[1]), float(b[2])
     l, w, h = float(b[3]), float(b[4]), float(b[5])
     yaw = float(b[6]) if b.size > 6 else 0.0
-    n_l = max(int(n_l), 1)
-    n_w = max(int(n_w), 1)
-    n_h = max(int(n_h), 1)
+    use = (mode or SAMPLE_MODE or "corners8").lower()
 
-    # Local coords in [-l/2, l/2] × [-w/2, w/2] × [-h/2, h/2]
-    xs = np.linspace(-0.5 * l, 0.5 * l, n_l, dtype=np.float64)
-    ys = np.linspace(-0.5 * w, 0.5 * w, n_w, dtype=np.float64)
-    zs = np.linspace(-0.5 * h, 0.5 * h, n_h, dtype=np.float64)
-    # Avoid degenerate zero-size axes collapsing to a single point repeatedly.
-    lx, ly, lz = np.meshgrid(xs, ys, zs, indexing="ij")
-    local = np.column_stack(
-        [lx.reshape(-1), ly.reshape(-1), lz.reshape(-1)]
-    )
+    if use in ("corners8", "corners", "8"):
+        # Local corners of the OBB (±l/2, ±w/2, ±h/2).
+        signs = np.array(
+            [
+                [-0.5, -0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+                [-0.5, 0.5, 0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            ],
+            dtype=np.float64,
+        )
+        local = signs * np.array([l, w, h], dtype=np.float64)
+    else:
+        n_l = max(int(n_l), 1)
+        n_w = max(int(n_w), 1)
+        n_h = max(int(n_h), 1)
+        xs = np.linspace(-0.5 * l, 0.5 * l, n_l, dtype=np.float64)
+        ys = np.linspace(-0.5 * w, 0.5 * w, n_w, dtype=np.float64)
+        zs = np.linspace(-0.5 * h, 0.5 * h, n_h, dtype=np.float64)
+        lx, ly, lz = np.meshgrid(xs, ys, zs, indexing="ij")
+        local = np.column_stack(
+            [lx.reshape(-1), ly.reshape(-1), lz.reshape(-1)]
+        )
 
     c, s = np.cos(yaw), np.sin(yaw)
-    # Rotate xy by yaw; z unchanged.
     xr = c * local[:, 0] - s * local[:, 1]
     yr = s * local[:, 0] + c * local[:, 1]
     return np.column_stack([xr + x, yr + y, local[:, 2] + z])

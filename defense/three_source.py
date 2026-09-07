@@ -457,6 +457,7 @@ def _c_init(
     n_ref_uav: float,
     r0: float,
     r_min: float = R_MIN,
+    r0_uav: Optional[float] = None,
 ):
     """C_init = mean(C_ego, C_uav) on the same init boxes (scheme §2.1.4)."""
     boxes_ego = np.asarray(boxes_ego)
@@ -466,7 +467,7 @@ def _c_init(
         boxes_ego, frame[ego_id]["lidar"], n_ref_ego, r0, r_min
     )
     c_u, n_u = _c_from_uav_lidar(
-        boxes_ego, frame, ego_id, uav_id, n_ref_uav, r0, r_min
+        boxes_ego, frame, ego_id, uav_id, n_ref_uav, float(r0 if r0_uav is None else r0_uav), r_min
     )
     cs = (c_e + c_u) / 2.0
     ns = ((n_e.astype(np.float64) + n_u.astype(np.float64)) / 2.0).astype(np.int32)
@@ -569,6 +570,7 @@ class ThreeSourceDetector:
         n_ref: float = N_REF_EGO,
         n_ref_uav: float = N_REF_UAV,
         r0: float = R0,
+        r0_uav: Optional[float] = None,
         r_min: float = R_MIN,
         score_thres: Optional[float] = None,
         theta_p: Optional[float] = None,
@@ -585,6 +587,7 @@ class ThreeSourceDetector:
         self.n_ref = float(n_ref)
         self.n_ref_uav = float(n_ref_uav)
         self.r0 = float(r0)
+        self.r0_uav = float(r0 if r0_uav is None else r0_uav)
         self.r_min = float(r_min)
         self.score_thres = score_thres
         if theta_p is not None:
@@ -682,7 +685,7 @@ class ThreeSourceDetector:
                         self.ego_id,
                         self.uav_id,
                         self.n_ref_uav,
-                        self.r0,
+                        self.r0_uav,
                         self.r_min,
                     )
                     if c.size:
@@ -813,6 +816,7 @@ class ThreeSourceDetector:
             self.n_ref_uav,
             self.r0,
             self.r_min,
+            r0_uav=self.r0_uav,
         )
 
         # Ego-only: dedicated vehicle PointPillars, or shared fusion head
@@ -838,7 +842,7 @@ class ThreeSourceDetector:
             fu = _keep_one_cav(frame, ego_id, lidar=uav_in_ego)
             b_uav, p_uav = _safe_run(self.perception, fu, ego_id, tag="uav")
         c_uav, n_uav = _c_from_uav_lidar(
-            b_uav, frame, ego_id, uav_id, self.n_ref_uav, self.r0, self.r_min
+            b_uav, frame, ego_id, uav_id, self.n_ref_uav, self.r0_uav, self.r_min
         )
 
         ego = SourceResult("ego", b_ego, p_ego, c_ego, n_ego)

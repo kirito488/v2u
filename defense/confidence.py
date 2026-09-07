@@ -22,17 +22,28 @@ import numpy as np
 from .geometry import count_points_in_box
 
 # §2.1.2  “typical vehicle, seen clearly”
-N_REF_EGO = 40.0
-N_REF_UAV = 25.0
-# §2.1.3  near-field floor; placeholder calibration
+# Calibrated 2026-09-07 on val clear-car pool (V≥0.9, r∈[8,40], median κ):
+#   logs/calibrate_confidence.json  (ego n_pool=113, uav n_pool=462)
+N_REF_EGO = 2029.72
+N_REF_UAV = 330.02
+# §2.1.3  near-field floor; reference range (per source after calib)
 R_MIN = 4.0
-R0 = 20.0
-# Typical passenger car (m) for A / A_ref
+R0 = 10.60
+R0_EGO = 10.60
+R0_UAV = 15.10
+# Typical passenger car (m) for A / A_ref (fallback if A_REF_* unset)
 L_REF, W_REF, H_REF = 4.5, 1.8, 1.5
+# Direct A_ref overrides (m^2). Calibrated medians from clear-car pool.
+A_REF_EGO: Optional[float] = 5.339
+A_REF_UAV: Optional[float] = 10.854
 
 
 def n_ref_for(source: str) -> float:
     return N_REF_UAV if source == "uav" else N_REF_EGO
+
+
+def r0_for(source: str) -> float:
+    return float(R0_UAV if source == "uav" else R0_EGO)
 
 
 def boxes_geometric_center(boxes):
@@ -63,10 +74,51 @@ def visible_area(bbox, source: str) -> float:
 
 
 def area_ref(source: str) -> float:
-    """§2.1.3  A_ref: Ego side ≈ h_ref * l_ref; UAV top ≈ l_ref * w_ref."""
+    """§2.1.3  A_ref: Ego side ≈ h_ref * l_ref; UAV top ≈ l_ref * w_ref.
+
+    Prefer calibrated A_REF_EGO / A_REF_UAV when set.
+    """
     if source == "uav":
+        if A_REF_UAV is not None:
+            return max(float(A_REF_UAV), 1e-6)
         return max(L_REF * W_REF, 1e-6)
+    if A_REF_EGO is not None:
+        return max(float(A_REF_EGO), 1e-6)
     return max(H_REF * L_REF, 1e-6)
+
+
+def apply_calibration(
+    *,
+    n_ref_ego: Optional[float] = None,
+    n_ref_uav: Optional[float] = None,
+    r0_ego: Optional[float] = None,
+    r0_uav: Optional[float] = None,
+    a_ref_ego: Optional[float] = None,
+    a_ref_uav: Optional[float] = None,
+) -> dict:
+    """Set module-level C calibration (used by perception_confidence)."""
+    global N_REF_EGO, N_REF_UAV, R0, R0_EGO, R0_UAV, A_REF_EGO, A_REF_UAV
+    if n_ref_ego is not None:
+        N_REF_EGO = float(n_ref_ego)
+    if n_ref_uav is not None:
+        N_REF_UAV = float(n_ref_uav)
+    if r0_ego is not None:
+        R0_EGO = float(r0_ego)
+        R0 = float(r0_ego)
+    if r0_uav is not None:
+        R0_UAV = float(r0_uav)
+    if a_ref_ego is not None:
+        A_REF_EGO = float(a_ref_ego)
+    if a_ref_uav is not None:
+        A_REF_UAV = float(a_ref_uav)
+    return {
+        "N_REF_EGO": N_REF_EGO,
+        "N_REF_UAV": N_REF_UAV,
+        "R0_EGO": R0_EGO,
+        "R0_UAV": R0_UAV,
+        "A_REF_EGO": A_REF_EGO,
+        "A_REF_UAV": A_REF_UAV,
+    }
 
 
 def range_xy(bbox, r_min: float = R_MIN) -> float:
@@ -106,22 +158,25 @@ def perception_confidence(
     source: str,
     n_ref: Optional[float] = None,
     n0: Optional[float] = None,
-    r0: float = R0,
+    r0: Optional[float] = None,
     r_min: float = R_MIN,
+    a_ref: Optional[float] = None,
 ) -> float:
     """§2.1.4  C = C_abs * C_n.
 
     bbox_sensor must be in the source LiDAR frame (geometric-center z).
-    Default calibration: n0 = n_ref, r0 = 20 m.
+    Default calibration: n0 = n_ref, r0 = r0_for(source).
     """
     n_ref = float(n_ref_for(source) if n_ref is None else n_ref)
     n0 = float(n_ref if n0 is None else n0)
+    r0_use = float(r0_for(source) if r0 is None else r0)
+    a_ref_use = float(area_ref(source) if a_ref is None else a_ref)
     n = float(n_pts)
     if n_ref <= 0 or n <= 0:
         return 0.0
     r = range_xy(bbox_sensor, r_min=r_min)
     n_exp = expected_points(
-        r, visible_area(bbox_sensor, source), n0, area_ref(source), r0=r0
+        r, visible_area(bbox_sensor, source), n0, a_ref_use, r0=r0_use
     )
     return float(c_abs(n, n_ref) * c_n(n, n_exp))
 
@@ -132,9 +187,10 @@ def confidences_for_boxes(
     source: str = "ego",
     n_ref: Optional[float] = None,
     pad: Optional[float] = None,
-    r0: float = R0,
+    r0: Optional[float] = None,
     r_min: float = R_MIN,
     bottom_center: bool = True,
+    a_ref: Optional[float] = None,
 ):
     """Per-box (C, n). boxes and lidar in the same sensor frame.
 
@@ -154,6 +210,6 @@ def confidences_for_boxes(
         n = count_points_in_box(lidar, b, pad=pad)
         ns[i] = n
         cs[i] = perception_confidence(
-            n, b, source, n_ref=n_ref, r0=r0, r_min=r_min
+            n, b, source, n_ref=n_ref, r0=r0, r_min=r_min, a_ref=a_ref
         )
     return cs, ns
