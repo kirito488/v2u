@@ -68,6 +68,7 @@ from defense.apply_attack import (  # noqa: E402
     primary_target,
     replace_init_with_attack,
 )
+from defense.buffer import THETA_CONFIRM  # noqa: E402
 from defense.gating import (  # noqa: E402
     Q_H,
     Q_L,
@@ -124,6 +125,11 @@ def _ckpt_fingerprint(args) -> dict:
         "early_remove_mode": args.early_remove_mode,
         "iters": int(getattr(args, "iters", 0) or 0),
         "also_ego": bool(args.also_ego),
+        "q_h": float(getattr(args, "q_h", 0) or 0),
+        "q_l": float(getattr(args, "q_l", 0) or 0),
+        "gate_q_mode": str(getattr(args, "gate_q_mode", "pc") or "pc"),
+        "theta_confirm": float(getattr(args, "theta_confirm", 0.7) or 0.7),
+        "buf_q_mode": str(getattr(args, "buf_q_mode", "pc_abs") or "pc_abs"),
     }
 
 
@@ -192,7 +198,8 @@ def resume_done_scenes(ckpt_dir: str | None, args, planned_scenes) -> list:
         return []
     fp = man.get("fingerprint") or {}
     want = _ckpt_fingerprint(args)
-    mismatch = [k for k in want if fp.get(k) != want[k]]
+    # Only compare keys the saved ckpt actually recorded (old runs lack q_h etc.).
+    mismatch = [k for k in fp if k in want and fp.get(k) != want[k]]
     if mismatch:
         print(
             "[ckpt] fingerprint mismatch on {}; ignore resume ({})".format(
@@ -540,13 +547,33 @@ def main():
         "--q_h",
         type=float,
         default=Q_H,
-        help="§5.1 Certain threshold on Q_ego (default θ_P·μ_h={:.2f})".format(Q_H),
+        help="§5.1 Certain threshold on Q_ego=P·C (default Q_H={:.2f})".format(Q_H),
     )
     ap.add_argument(
         "--q_l",
         type=float,
         default=Q_L,
-        help="§5.1 Ambiguous lower bound on Q_ego (default θ_P·μ_l={:.2f})".format(Q_L),
+        help="§5.1 Ambiguous lower bound on Q_ego (default Q_L={:.2f}; also buffer ψ ref)".format(Q_L),
+    )
+    ap.add_argument(
+        "--gate_q_mode",
+        type=str,
+        default="pc",
+        choices=["pc", "p"],
+        help="spatial gate score: pc=P·C (default) or p=P only (drop C/V from partition)",
+    )
+    ap.add_argument(
+        "--theta_confirm",
+        type=float,
+        default=None,
+        help="Tentative confirm threshold on posterior p (default THETA_CONFIRM=0.7)",
+    )
+    ap.add_argument(
+        "--buf_q_mode",
+        type=str,
+        default="pc_abs",
+        choices=["pc_abs", "p"],
+        help="buffer ψ score: pc_abs=P·C_abs (default) or p=P only",
     )
     ap.add_argument(
         "--mode",
@@ -635,6 +662,8 @@ def main():
             os.environ["CUDA_VISIBLE_DEVICES"]), flush=True)
     if args.theta_p is None:
         args.theta_p = args.score_thres
+    if args.theta_confirm is None:
+        args.theta_confirm = float(THETA_CONFIRM)
     if args.mode in ("multi_spoof", "mass_remove") and args.level != "intermediate":
         print(
             "[warn] mode={!r} forces --level intermediate".format(args.mode),
@@ -744,6 +773,9 @@ def main():
         q_l=args.q_l,
         ego_perception=ego_perception,
         uav_perception=uav_perception,
+        gate_q_mode=args.gate_q_mode,
+        theta_confirm=args.theta_confirm,
+        buf_q_mode=args.buf_q_mode,
     )
 
     print(
@@ -758,6 +790,9 @@ def main():
         "  a_ref_uav =", args.a_ref_uav,
         "  q_h =", args.q_h,
         "  q_l =", args.q_l,
+        "  gate_q_mode =", args.gate_q_mode,
+        "  theta_confirm =", args.theta_confirm,
+        "  buf_q_mode =", args.buf_q_mode,
         "  mode =", args.mode,
         "  level =", args.level,
         "  n_objects =", args.n_objects,
@@ -766,12 +801,16 @@ def main():
     )
     if args.verbose:
         from defense.occlusion import V_MIN, K_ATK
-        from defense.buffer import THETA_CONFIRM, THETA_REJECT, THETA_SOFT
+        from defense.buffer import (
+            THETA_CONFIRM as _THETA_CONFIRM,
+            THETA_REJECT as _THETA_REJECT,
+            THETA_SOFT as _THETA_SOFT,
+        )
         from defense.trust_pool import POOL_K
         print(
             "[params -v] V_min={}  K_atk={}  θ_confirm={}  θ_reject={}  "
             "θ_soft={}  POOL_K={}  quiet={}".format(
-                V_MIN, K_ATK, THETA_CONFIRM, THETA_REJECT, THETA_SOFT, POOL_K, quiet,
+                V_MIN, K_ATK, _THETA_CONFIRM, _THETA_REJECT, _THETA_SOFT, POOL_K, quiet,
             ),
             flush=True,
         )
@@ -1064,6 +1103,9 @@ def main():
             "calib_json": args.calib_json,
             "q_h": args.q_h,
             "q_l": args.q_l,
+            "gate_q_mode": args.gate_q_mode,
+            "theta_confirm": args.theta_confirm,
+            "buf_q_mode": args.buf_q_mode,
             "mode": args.mode,
             "level": args.level,
             "n_objects": args.n_objects,

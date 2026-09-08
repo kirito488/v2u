@@ -18,8 +18,8 @@ import numpy as np
 
 from .metrics import lidar_range_mask
 
-# Visibility threshold: ≥2 of 8 box corners free (common 8-corner visibility
-# convention; cf. monocular/LiDAR bbox-corner visibility literature).
+# Visibility threshold: fraction of free sample rays (with 75-ray grid,
+# 0.25 ≈ ≥19/75 free). Same ratio as the old ≥2/8 corner rule.
 V_MIN = 0.25
 K_ATK = 10
 # Range slack when comparing polar returns to near-face cutoff (metres).
@@ -47,13 +47,13 @@ CLEAR_DIST_M = 0.5
 # Neighbour bins (±nb) to reduce polar discretisation holes (same spirit as
 # OctoMap / WYSIWYG raycasting aggregation robustness).
 POLAR_NB = 1
-# Query-box ray samples. Literature default = 8 OBB corners
-# (e.g. bbox-corner visibility / occlusion checks). Dense L×W×H grids were
-# ad-hoc; kept as optional SAMPLE_MODE="grid" for ablation.
-SAMPLE_MODE = "corners8"  # "corners8" | "grid"
-SAMPLE_L = 2  # only used when SAMPLE_MODE == "grid"
-SAMPLE_W = 2
-SAMPLE_H = 2
+# Query-box ray samples. Default = dense OBB grid 5×5×3 = 75 rays
+# (replaces 8-corner probes for smoother partial-occlusion V).
+# Set SAMPLE_MODE="corners8" for the classic 8-corner ablation.
+SAMPLE_MODE = "grid"  # "corners8" | "grid"
+SAMPLE_L = 5
+SAMPLE_W = 5
+SAMPLE_H = 3  # 5*5*3 = 75
 
 
 def _as_boxes(boxes) -> np.ndarray:

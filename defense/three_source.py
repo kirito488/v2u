@@ -13,7 +13,7 @@ vehicle frame and placed on the ego slot (AttFuse z-range is vehicle BEV).
 Each source returns (B, P, C):
 - B: boxes (N,7) in ego lidar frame [x,y,z,l,w,h,yaw]
 - P: existence scores from the detector
-- C: perception confidence C_abs * C_n (scheme §2.1)
+- C: perception confidence C_abs * V (V replaces C_n; polar-depth rays)
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from .confidence import (
 from .geometry import blank_lidar, iou_bev, pack_dets
 from .gating import CERTAIN, Q_H, Q_L, THETA_P, force_certain_for_gt_id, gate_frame
 from .far_certain import FarCertainTracker, T_FAR, backfill_tentative_to_certain
-from .buffer import CONFIRM, SoftEgoDet, THETA_SOFT, TentativeBuffer
+from .buffer import CONFIRM, SoftEgoDet, THETA_CONFIRM, THETA_SOFT, TentativeBuffer
 from .trust_pool import TrustPool
 from .occlusion import build_polar_depth, visibility_ratio_lidar
 from .paths import EGO_ID, UAV_ID
@@ -51,8 +51,14 @@ class SourceResult:
     name: str
     boxes: np.ndarray  # (N, 7)
     scores: np.ndarray  # (N,) P
-    confidences: np.ndarray  # (N,) C
+    confidences: np.ndarray  # (N,) C = C_abs * V
     point_counts: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int32))
+    visibilities: np.ndarray = field(
+        default_factory=lambda: np.zeros((0,), dtype=np.float64)
+    )  # (N,) polar V
+    c_abs: np.ndarray = field(
+        default_factory=lambda: np.zeros((0,), dtype=np.float64)
+    )  # (N,) C_abs = clip(n/n_ref)
 
     def filter_by_score(self, score_thres: float) -> "SourceResult":
         if self.boxes.shape[0] == 0:
@@ -63,7 +69,13 @@ class SourceResult:
             boxes=self.boxes[m],
             scores=self.scores[m],
             confidences=self.confidences[m],
-            point_counts=self.point_counts[m] if len(self.point_counts) == len(m) else self.point_counts,
+            point_counts=self.point_counts[m]
+            if len(self.point_counts) == len(m)
+            else self.point_counts,
+            visibilities=self.visibilities[m]
+            if len(self.visibilities) == len(m)
+            else self.visibilities,
+            c_abs=self.c_abs[m] if len(self.c_abs) == len(m) else self.c_abs,
         )
 
     def score_band(self, lo: float, hi: float) -> "SourceResult":
@@ -76,7 +88,13 @@ class SourceResult:
             boxes=self.boxes[m],
             scores=self.scores[m],
             confidences=self.confidences[m],
-            point_counts=self.point_counts[m] if len(self.point_counts) == len(m) else self.point_counts,
+            point_counts=self.point_counts[m]
+            if len(self.point_counts) == len(m)
+            else self.point_counts,
+            visibilities=self.visibilities[m]
+            if len(self.visibilities) == len(m)
+            else self.visibilities,
+            c_abs=self.c_abs[m] if len(self.c_abs) == len(m) else self.c_abs,
         )
 
     def dump_lines(
@@ -119,14 +137,31 @@ class SourceResult:
                 extra = "  {} id={} iou={:.2f} dxy={:.1f}m".format(tag, gid, iou, dist)
             n_pts = int(self.point_counts[i]) if i < len(self.point_counts) else -1
             extra_n = "  n={}".format(n_pts) if n_pts >= 0 else ""
+            v = float(self.visibilities[i]) if i < len(self.visibilities) else float("nan")
+            extra_v = "  V={:.3f}".format(v) if v == v else ""
+            q = float(p) * float(c)
             gate_extra = ""
             if gate_states is not None:
                 st = gate_states.get(int(i))
                 gate_extra = "  state={}".format(st if st else "—")
             lines.append(
                 "  #{:<2d}  B=[{:7.2f} {:7.2f} {:6.2f}  {:5.2f} {:5.2f} {:5.2f} {:6.3f}]  "
-                "P={:.3f}  C={:.3f}{}{}{}".format(
-                    k, b[0], b[1], b[2], b[3], b[4], b[5], b[6], p, c, extra_n, extra, gate_extra
+                "P={:.3f}  C={:.3f}  Q={:.3f}{}{}{}{}".format(
+                    k,
+                    b[0],
+                    b[1],
+                    b[2],
+                    b[3],
+                    b[4],
+                    b[5],
+                    b[6],
+                    p,
+                    c,
+                    q,
+                    extra_n,
+                    extra_v,
+                    extra,
+                    gate_extra,
                 )
             )
         return lines
@@ -416,7 +451,7 @@ def _safe_run(perception, frame, ego_id, tag="") -> Tuple[np.ndarray, np.ndarray
 
 
 def _c_from_ego_lidar(boxes, lidar_ego, n_ref: float, r0: float, r_min: float = R_MIN):
-    """C_ego: Ego cloud + Ego origin; A_ego heading-aware (scheme §2.1.3)."""
+    """C_ego = C_abs * V_ego (polar depth on ego cloud). Returns C,n,V,C_abs."""
     return confidences_for_boxes(
         boxes, lidar_ego, source="ego", n_ref=n_ref, r0=r0, r_min=r_min
     )
@@ -425,14 +460,16 @@ def _c_from_ego_lidar(boxes, lidar_ego, n_ref: float, r0: float, r_min: float = 
 def _c_from_uav_lidar(
     boxes_ego, frame, ego_id, uav_id, n_ref: float, r0: float, r_min: float = R_MIN
 ):
-    """C_uav: UAV cloud + UAV origin; A_uav = l*w (scheme §2.1.3).
+    """C_uav = C_abs * V_uav on UAV cloud (boxes warped to UAV frame).
 
     Lift z to geometric center in ego frame, then warp, so height is not
     re-applied along UAV z after the pose transform.
     """
     boxes_ego = np.asarray(boxes_ego)
     if boxes_ego.ndim != 2 or boxes_ego.shape[0] == 0:
-        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.int32)
+        zc = np.zeros((0,), dtype=np.float64)
+        zn = np.zeros((0,), dtype=np.int32)
+        return zc, zn, zc.copy(), zc.copy()
     pose_e = frame[ego_id]["lidar_pose"]
     pose_u = frame[uav_id]["lidar_pose"]
     lidar_u = frame[uav_id]["lidar"]
@@ -459,19 +496,29 @@ def _c_init(
     r_min: float = R_MIN,
     r0_uav: Optional[float] = None,
 ):
-    """C_init = mean(C_ego, C_uav) on the same init boxes (scheme §2.1.4)."""
+    """C_init = mean(C_ego, C_uav); also mean V and C_abs."""
     boxes_ego = np.asarray(boxes_ego)
     if boxes_ego.ndim != 2 or boxes_ego.shape[0] == 0:
-        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.int32)
-    c_e, n_e = _c_from_ego_lidar(
+        zc = np.zeros((0,), dtype=np.float64)
+        zn = np.zeros((0,), dtype=np.int32)
+        return zc, zn, zc.copy(), zc.copy()
+    c_e, n_e, v_e, ca_e = _c_from_ego_lidar(
         boxes_ego, frame[ego_id]["lidar"], n_ref_ego, r0, r_min
     )
-    c_u, n_u = _c_from_uav_lidar(
-        boxes_ego, frame, ego_id, uav_id, n_ref_uav, float(r0 if r0_uav is None else r0_uav), r_min
+    c_u, n_u, v_u, ca_u = _c_from_uav_lidar(
+        boxes_ego,
+        frame,
+        ego_id,
+        uav_id,
+        n_ref_uav,
+        float(r0 if r0_uav is None else r0_uav),
+        r_min,
     )
     cs = (c_e + c_u) / 2.0
     ns = ((n_e.astype(np.float64) + n_u.astype(np.float64)) / 2.0).astype(np.int32)
-    return cs, ns
+    vs = (v_e + v_u) / 2.0
+    cas = (ca_e + ca_u) / 2.0
+    return cs, ns, vs, cas
 
 
 def _concat_boxes(*arrs) -> np.ndarray:
@@ -536,7 +583,9 @@ def _pool_birth_from(gating, buf, gt_lists=None):
     return np.stack(boxes), cs, flags, trajs
 
 
-def _soft_ego_dets(ego_raw, hard_thres, soft_thres: float = THETA_SOFT):
+def _soft_ego_dets(
+    ego_raw, hard_thres, soft_thres: float = THETA_SOFT, buf_q_mode: str = "pc_abs"
+):
     """Ego boxes with θ_soft ≤ P < score_thres — buffer evidence only."""
     if ego_raw is None or hard_thres is None:
         return []
@@ -545,14 +594,16 @@ def _soft_ego_dets(ego_raw, hard_thres, soft_thres: float = THETA_SOFT):
     if hi <= lo or getattr(ego_raw, "n", 0) <= 0:
         return []
     band = ego_raw.score_band(lo, hi)
+    use_p = str(buf_q_mode or "pc_abs").lower() in ("p", "p_only", "score")
     out = []
     for i in range(int(band.n)):
         p = float(band.scores[i])
-        c = float(band.confidences[i]) if i < len(band.confidences) else 0.0
+        ca = float(band.c_abs[i]) if i < len(band.c_abs) else 0.0
+        q = float(p) if use_p else float(p) * float(ca)
         out.append(
             SoftEgoDet(
                 box=np.asarray(band.boxes[i], dtype=np.float64)[:7].copy(),
-                q=float(p) * float(c),
+                q=q,
                 p=float(p),
             )
         )
@@ -578,6 +629,9 @@ class ThreeSourceDetector:
         q_l: float = Q_L,
         ego_perception=None,
         uav_perception=None,
+        gate_q_mode: str = "pc",
+        theta_confirm: float = THETA_CONFIRM,
+        buf_q_mode: str = "pc_abs",
     ):
         self.perception = perception
         self.ego_perception = ego_perception
@@ -598,7 +652,14 @@ class ThreeSourceDetector:
             self.theta_p = float(THETA_P)
         self.q_h = float(q_h)
         self.q_l = float(q_l)
-        self.tent_buffer = TentativeBuffer(q_l=self.q_l)
+        self.gate_q_mode = str(gate_q_mode or "pc")
+        self.theta_confirm = float(theta_confirm)
+        self.buf_q_mode = str(buf_q_mode or "pc_abs")
+        self.tent_buffer = TentativeBuffer(
+            q_l=self.q_l,
+            theta_confirm=self.theta_confirm,
+            buf_q_mode=self.buf_q_mode,
+        )
         self.far_tracker = FarCertainTracker()
         self.trust_pool = TrustPool(
             theta_p=self.theta_p,
@@ -640,6 +701,7 @@ class ThreeSourceDetector:
             theta_p=self.theta_p,
             q_h=self.q_h,
             q_l=self.q_l,
+            gate_q_mode=self.gate_q_mode,
         )
         gating = force_certain_for_gt_id(gating, gt_eval, gt_eval_ids)
         gating = force_certain_for_gt_id(gating, gt_ego, gt_ego_ids)
@@ -679,7 +741,7 @@ class ThreeSourceDetector:
             try:
                 b = np.asarray(box, dtype=np.float64).reshape(-1)
                 if b.size >= 7 and frame is not None and self.uav_id in frame:
-                    c, _ = _c_from_uav_lidar(
+                    c, _, _, _ = _c_from_uav_lidar(
                         b[:7].reshape(1, 7),
                         frame,
                         self.ego_id,
@@ -767,7 +829,9 @@ class ThreeSourceDetector:
             gt_eval_ids,
             frame_id=frame_id,
             match_objects=list(gating.objects),
-            soft_ego=_soft_ego_dets(ego_raw, self.score_thres),
+            soft_ego=_soft_ego_dets(
+                ego_raw, self.score_thres, buf_q_mode=self.buf_q_mode
+            ),
             visibility_fn=_ego_vis if ego_depth is not None else None,
             ego=ego,
             uav=uav,
@@ -807,7 +871,7 @@ class ThreeSourceDetector:
                 self.perception.model._defense_z = None
         except Exception:
             pass
-        c_init, n_init = _c_init(
+        c_init, n_init, v_init, ca_init = _c_init(
             b_init,
             frame,
             ego_id,
@@ -825,7 +889,7 @@ class ThreeSourceDetector:
         else:
             fe = _keep_one_cav(frame, ego_id)
             b_ego, p_ego = _safe_run(self.perception, fe, ego_id, tag="ego")
-        c_ego, n_ego = _c_from_ego_lidar(
+        c_ego, n_ego, v_ego, ca_ego = _c_from_ego_lidar(
             b_ego, frame[ego_id]["lidar"], self.n_ref, self.r0, self.r_min
         )
 
@@ -841,13 +905,13 @@ class ThreeSourceDetector:
             )
             fu = _keep_one_cav(frame, ego_id, lidar=uav_in_ego)
             b_uav, p_uav = _safe_run(self.perception, fu, ego_id, tag="uav")
-        c_uav, n_uav = _c_from_uav_lidar(
+        c_uav, n_uav, v_uav, ca_uav = _c_from_uav_lidar(
             b_uav, frame, ego_id, uav_id, self.n_ref_uav, self.r0_uav, self.r_min
         )
 
-        ego = SourceResult("ego", b_ego, p_ego, c_ego, n_ego)
-        uav = SourceResult("uav", b_uav, p_uav, c_uav, n_uav)
-        init = SourceResult("init", b_init, p_init, c_init, n_init)
+        ego = SourceResult("ego", b_ego, p_ego, c_ego, n_ego, v_ego, ca_ego)
+        uav = SourceResult("uav", b_uav, p_uav, c_uav, n_uav, v_uav, ca_uav)
+        init = SourceResult("init", b_init, p_init, c_init, n_init, v_init, ca_init)
         ego_raw = ego
 
         def _maxp(src):
@@ -968,12 +1032,24 @@ def results_to_dict(frames: List[FrameThreeSource]) -> List[Dict[str, Any]]:
             "gt_uav_ids": fr.gt_uav_ids,
         }
         for key, src in (("ego", fr.ego), ("uav", fr.uav), ("init", fr.init)):
+            qs = (
+                (np.asarray(src.scores, dtype=np.float64) * np.asarray(src.confidences, dtype=np.float64)).tolist()
+                if src.n
+                else []
+            )
             row[key] = {
                 "n": src.n,
                 "boxes": src.boxes.tolist(),
                 "scores": src.scores.tolist(),
                 "confidences": src.confidences.tolist(),
                 "point_counts": src.point_counts.tolist(),
+                "visibilities": np.asarray(src.visibilities, dtype=np.float64).tolist()
+                if src.n and len(src.visibilities) == src.n
+                else [],
+                "c_abs": np.asarray(src.c_abs, dtype=np.float64).tolist()
+                if src.n and len(src.c_abs) == src.n
+                else [],
+                "qualities": qs,
             }
         if fr.gating is not None:
             row["gating"] = fr.gating.to_dict()

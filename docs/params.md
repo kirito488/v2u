@@ -30,7 +30,7 @@
 | Score / presence gate | run `--score_thres`; intended `THETA_P` | **0.3** (runs); code default `THETA_P=0.5` | **CAL** | **Unify code `THETA_P` with run `score_thres`.** Prefer OpenCOOD-style 0.3, or clean-val score percentile. |
 | High quality scale | `MU_H` | 0.7 | **CAL** | Keep; `Q_h = θ_P · μ_h` must track `θ_P`. |
 | Low quality scale | `MU_L` | 0.5 | **CAL** | Same. With `θ_P=0.3` → `Q_h=0.21`, `Q_l=0.15` if formulas stay linked. |
-| Certain / tentative cut | `Q_H`, `Q_L` | 0.35 / 0.25 *(at θ_P=0.5)* | **CAL** | Recalibrate after fixing `θ_P`; optional clean Q percentiles. |
+| Certain / tentative cut | `Q_H`, `Q_L` | **0.40 / 0.30** | **CAL** | 2026-09-07 clean 200f under \(C=C_{\mathrm{abs}}V\), \(n_{\mathrm{ref}}=200\). Old 0.35/0.25 (θ_P=0.5·μ) too Certain-heavy when \(C\approx1\); θ_P=0.3·μ=0.21/0.15 collapses Ambiguous. |
 | Soft-Ego lower band | `THETA_SOFT` | 0.05 | **LOCK** | Buffer-only band `[θ_soft, θ_P)`. |
 | Force-certain debug id | `FORCE_CERTAIN_GT_ID` | `"1"` | **LOCK** | Debug / dump only. |
 
@@ -149,7 +149,7 @@
 
 ## Priority fixes (before more ablation)
 
-1. **Align `THETA_P` with `score_thres=0.3`** and recompute `Q_H/Q_L = θ_P · μ`.
+1. **Done (2026-09-07):** `Q_H/Q_L = 0.40/0.30` under `C=C_abs·V` (not blind `θ_P·μ`).
 2. **Calibrate `N_REF_EGO/UAV`** on clean val so \(C\) is not almost always 1.
 3. Keep polar-\(V\) numbers as in §4 (BtcDet + 8 corners + Ouster 0.5 m); ablate only **on/off**, not the bin sizes.
 

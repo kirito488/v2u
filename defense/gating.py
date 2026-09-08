@@ -2,9 +2,13 @@
 
 Only leftover detections that did not match the trust pool (scheme §4.3.0).
 
-Q_ego = P_ego * C_ego
-Q_h = theta_P * mu_h = 0.35
-Q_l = theta_P * mu_l = 0.25
+Gate Q_ego = P_ego * C_ego  (C = C_abs * V)
+Buffer ψ uses Q_buf = P * C_abs (see defense.buffer).
+
+Q_h / Q_l recalibrated 2026-09-07 on clean probe (C=C_abs·V, n_ref=200,
+score_thres=0.3, 200 frames): ego Q≈P (C often ~1). Old θ_P·μ with θ_P=0.5
+gave 0.35/0.25; linking θ_P=0.3→0.21/0.15 collapses Ambiguous. New defaults
+keep a usable Certain / Ambiguous / Tentative mass (~61% / 25% / 14%).
 
 D_src = 1 iff that source has P >= theta_P and Hungarian-matches this object.
 
@@ -20,11 +24,13 @@ import numpy as np
 from .associate import THETA_IOU, hungarian_match
 from .geometry import iou_bev
 
-THETA_P = 0.5
+THETA_P = 0.5  # scheme default; batch runs usually override via score_thres=0.3
+# Legacy μ (documentation / optional linkage); gate cuts are explicit below.
 MU_H = 0.7
 MU_L = 0.5
-Q_H = THETA_P * MU_H  # 0.35
-Q_L = THETA_P * MU_L  # 0.25
+# CAL 2026-09-07: clean 200f Q=P·C percentiles under C=C_abs·V, n_ref=200
+Q_H = 0.40
+Q_L = 0.30
 
 CERTAIN = "certain"
 AMBIGUOUS = "ambiguous"
@@ -160,6 +166,7 @@ class GatedObject:
     q_ego: float
     p_ego: float
     c_ego: float
+    c_abs_ego: float = 0.0  # clip(n/n_ref); buffer ψ uses Q=P·C_abs
     ego_i: int = -1
     uav_i: int = -1
     init_i: int = -1
@@ -300,6 +307,7 @@ class FrameGating:
                     "q_ego": o.q_ego,
                     "p_ego": o.p_ego,
                     "c_ego": o.c_ego,
+                    "c_abs_ego": float(getattr(o, "c_abs_ego", 0.0) or 0.0),
                     "ego_i": o.ego_i,
                     "uav_i": o.uav_i,
                     "init_i": o.init_i,
@@ -325,6 +333,24 @@ def _src_pc(src: Any, i: int):
     return p, c
 
 
+def _src_c_abs(src: Any, i: int) -> float:
+    cas = getattr(src, "c_abs", None)
+    if cas is not None:
+        a = np.asarray(cas)
+        if i >= 0 and i < len(a):
+            return float(a[i])
+    # Recover from C/V if needed (C = C_abs * V).
+    confs = np.asarray(getattr(src, "confidences", []))
+    vs = np.asarray(getattr(src, "visibilities", []))
+    if i < 0 or i >= len(confs):
+        return 0.0
+    c = float(confs[i])
+    v = float(vs[i]) if i < len(vs) else 1.0
+    if v > 1e-6:
+        return float(np.clip(c / v, 0.0, 1.0))
+    return 0.0
+
+
 def gate_frame(
     ego: Any,
     uav: Any,
@@ -336,6 +362,7 @@ def gate_frame(
     exclude_ego=None,
     exclude_uav=None,
     exclude_init=None,
+    gate_q_mode: str = "pc",
 ) -> FrameGating:
     """Associate three sources, apply §5.1 spatial gating, then §6.3.
 
@@ -363,7 +390,12 @@ def gate_frame(
     for a in range(len(ei)):
         gi = int(ei[a])
         p, c = _src_pc(ego, gi)
-        q = detection_quality(p, c)
+        ca = _src_c_abs(ego, gi)
+        # Spatial partition: default Q=P·C. Ablation gate_q_mode="p" drops C/V (Q=P).
+        if str(gate_q_mode).lower() in ("p", "p_only", "score"):
+            q = float(p)
+        else:
+            q = detection_quality(p, c)
         ju, iou_u = ego_uav.get(a, (-1, 0.0))
         ji, iou_i = ego_init.get(a, (-1, 0.0))
         d_uav = 1 if ju >= 0 else 0
@@ -385,6 +417,7 @@ def gate_frame(
                 q_ego=q,
                 p_ego=p,
                 c_ego=c,
+                c_abs_ego=ca,
                 ego_i=gi,
                 uav_i=uav_i,
                 init_i=init_i,

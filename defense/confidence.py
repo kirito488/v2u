@@ -1,19 +1,17 @@
-"""Perception confidence C = C_abs * C_n  (UAV_UGV_DEFENSE_SCHEME.html §2.1).
+"""Perception confidence C = C_abs * V  (occlusion replaces relative density C_n).
 
 C answers: did this sensor see the object clearly?
-  C_abs  — enough absolute points in the box?
-  C_n    — enough points relative to the expected count at this range?
+  C_abs  — enough absolute points in the box?  clip(n / n_ref)
+  V      — polar-depth ray visibility (fraction of free rays to the box)
 
-n is counted in the source LiDAR frame. r is range to that source origin.
+Previously C = C_abs * C_n with C_n = n / n_exp(r, A). That path is kept only
+as ``use_cn=True`` for ablation; default is V.
 
-Visible area A (scheme geometry, not a printed PDV/GACE formula):
-  Ego (side):  A = h * (l |sin(θ−φ)| + w |cos(θ−φ)|),  φ = atan2(y, x)
-  UAV (top):   A = l * w
-Old A_ego = h * max(l, w) ignored heading and is not used.
+n is counted in the source LiDAR frame.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import math
 
@@ -22,20 +20,21 @@ import numpy as np
 from .geometry import count_points_in_box
 
 # §2.1.2  “typical vehicle, seen clearly”
-# Calibrated 2026-09-07 on val clear-car pool (V≥0.9, r∈[8,40], median κ):
-#   logs/calibrate_confidence.json  (ego n_pool=113, uav n_pool=462)
-N_REF_EGO = 2029.72
-N_REF_UAV = 330.02
-# §2.1.3  near-field floor; reference range (per source after calib)
+# Probe default for C=C_abs*V: ~25 m ego p10–p25 scale (see logs n@25m).
+# Old clear-pool median (~2029) crushed mid-range C_abs under V product.
+N_REF_EGO = 200.0
+N_REF_UAV = 200.0
+# Legacy / optional C_n calibration (unused when use_cn=False)
 R_MIN = 4.0
 R0 = 10.60
 R0_EGO = 10.60
 R0_UAV = 15.10
-# Typical passenger car (m) for A / A_ref (fallback if A_REF_* unset)
 L_REF, W_REF, H_REF = 4.5, 1.8, 1.5
-# Direct A_ref overrides (m^2). Calibrated medians from clear-car pool.
 A_REF_EGO: Optional[float] = 5.339
 A_REF_UAV: Optional[float] = 10.854
+
+# Default: replace C_n with polar visibility V
+USE_CN = False
 
 
 def n_ref_for(source: str) -> float:
@@ -61,7 +60,7 @@ def boxes_geometric_center(boxes):
 
 
 def visible_area(bbox, source: str) -> float:
-    """§2.1.3  A for n_exp. bbox must be in the source LiDAR frame."""
+    """§2.1.3  A for n_exp (legacy C_n only). bbox in source LiDAR frame."""
     l, w, h = float(bbox[3]), float(bbox[4]), float(bbox[5])
     if source == "uav":
         return max(l * w, 1e-6)
@@ -74,10 +73,7 @@ def visible_area(bbox, source: str) -> float:
 
 
 def area_ref(source: str) -> float:
-    """§2.1.3  A_ref: Ego side ≈ h_ref * l_ref; UAV top ≈ l_ref * w_ref.
-
-    Prefer calibrated A_REF_EGO / A_REF_UAV when set.
-    """
+    """§2.1.3  A_ref (legacy C_n only)."""
     if source == "uav":
         if A_REF_UAV is not None:
             return max(float(A_REF_UAV), 1e-6)
@@ -127,7 +123,7 @@ def range_xy(bbox, r_min: float = R_MIN) -> float:
 
 
 def expected_points(r, area, n0, a_ref, r0: float = R0) -> float:
-    """n_exp = n0 * (A / A_ref) * (r0 / r)^2."""
+    """n_exp = n0 * (A / A_ref) * (r0 / r)^2.  Legacy C_n only."""
     r = max(float(r), 1e-6)
     a_ref = max(float(a_ref), 1e-6)
     return float(n0) * (float(area) / a_ref) * (float(r0) / r) ** 2
@@ -141,7 +137,7 @@ def c_abs(n_pts, n_ref) -> float:
 
 
 def c_n(n_pts, n_exp) -> float:
-    """§2.1.3  clip(n / n_exp, 0, 1)."""
+    """§2.1.3  clip(n / n_exp, 0, 1). Legacy."""
     if n_exp <= 0:
         return 0.0
     return float(np.clip(float(n_pts) / float(n_exp), 0.0, 1.0))
@@ -161,24 +157,32 @@ def perception_confidence(
     r0: Optional[float] = None,
     r_min: float = R_MIN,
     a_ref: Optional[float] = None,
+    visibility: Optional[float] = None,
+    use_cn: Optional[bool] = None,
 ) -> float:
-    """§2.1.4  C = C_abs * C_n.
+    """C = C_abs * V  (default), or C_abs * C_n if use_cn.
 
     bbox_sensor must be in the source LiDAR frame (geometric-center z).
-    Default calibration: n0 = n_ref, r0 = r0_for(source).
+    ``visibility`` in [0,1] from polar-depth rays; if None and not use_cn, V=1
+    (C degenerates to C_abs).
     """
     n_ref = float(n_ref_for(source) if n_ref is None else n_ref)
-    n0 = float(n_ref if n0 is None else n0)
-    r0_use = float(r0_for(source) if r0 is None else r0)
-    a_ref_use = float(area_ref(source) if a_ref is None else a_ref)
     n = float(n_pts)
     if n_ref <= 0 or n <= 0:
         return 0.0
-    r = range_xy(bbox_sensor, r_min=r_min)
-    n_exp = expected_points(
-        r, visible_area(bbox_sensor, source), n0, a_ref_use, r0=r0_use
-    )
-    return float(c_abs(n, n_ref) * c_n(n, n_exp))
+    ca = c_abs(n, n_ref)
+    use_cn_flag = bool(USE_CN if use_cn is None else use_cn)
+    if use_cn_flag:
+        n0 = float(n_ref if n0 is None else n0)
+        r0_use = float(r0_for(source) if r0 is None else r0)
+        a_ref_use = float(area_ref(source) if a_ref is None else a_ref)
+        r = range_xy(bbox_sensor, r_min=r_min)
+        n_exp = expected_points(
+            r, visible_area(bbox_sensor, source), n0, a_ref_use, r0=r0_use
+        )
+        return float(ca * c_n(n, n_exp))
+    v = 1.0 if visibility is None else float(np.clip(visibility, 0.0, 1.0))
+    return float(ca * v)
 
 
 def confidences_for_boxes(
@@ -191,25 +195,79 @@ def confidences_for_boxes(
     r_min: float = R_MIN,
     bottom_center: bool = True,
     a_ref: Optional[float] = None,
-):
-    """Per-box (C, n). boxes and lidar in the same sensor frame.
+    use_cn: Optional[bool] = None,
+    return_visibility: bool = True,
+) -> Union[
+    Tuple[np.ndarray, np.ndarray],
+    Tuple[np.ndarray, np.ndarray, np.ndarray],
+]:
+    """Per-box (C, n[, V]). boxes and lidar in the same sensor frame.
 
-    If bottom_center, z is lifted to the geometric center before counting.
+    Builds one polar depth map and sets C = C_abs * V (unless use_cn).
+    If bottom_center, z is lifted to the geometric center before counting / V.
     UAV pad is larger (scheme: top-view boxes may need extra pad).
     """
     boxes = np.asarray(boxes)
     if boxes.ndim != 2 or boxes.shape[0] == 0:
-        return np.zeros((0,), dtype=np.float64), np.zeros((0,), dtype=np.int32)
+        empty_c = np.zeros((0,), dtype=np.float64)
+        empty_n = np.zeros((0,), dtype=np.int32)
+        empty_v = np.zeros((0,), dtype=np.float64)
+        if return_visibility:
+            return empty_c, empty_n, empty_v, empty_c.copy()
+        return empty_c, empty_n, empty_c.copy()
     n_ref = n_ref_for(source) if n_ref is None else float(n_ref)
     if pad is None:
         pad = 0.5 if source == "uav" else 0.25
     boxes_use = boxes_geometric_center(boxes) if bottom_center else boxes
+    use_cn_flag = bool(USE_CN if use_cn is None else use_cn)
+
+    depth = None
+    if not use_cn_flag:
+        try:
+            from .occlusion import build_polar_depth
+
+            depth = build_polar_depth(lidar)
+        except Exception:
+            depth = None
+
     cs = np.zeros((boxes_use.shape[0],), dtype=np.float64)
     ns = np.zeros((boxes_use.shape[0],), dtype=np.int32)
+    vs = np.ones((boxes_use.shape[0],), dtype=np.float64)
+    cas = np.zeros((boxes_use.shape[0],), dtype=np.float64)
     for i, b in enumerate(boxes_use):
         n = count_points_in_box(lidar, b, pad=pad)
         ns[i] = n
+        ca = c_abs(n, n_ref)
+        cas[i] = ca
+        v = 1.0
+        if not use_cn_flag and depth is not None:
+            try:
+                from .occlusion import visibility_ratio_lidar
+
+                v = float(
+                    visibility_ratio_lidar(
+                        b,
+                        depth=depth,
+                        origin=(0.0, 0.0, 0.0),
+                        # ego boxes may be out of eval range; uav frame boxes are not
+                        check_ego_range=(source == "ego"),
+                        bottom_center=False,  # already geometric-center
+                    )
+                )
+            except Exception:
+                v = 0.0
+        vs[i] = v
         cs[i] = perception_confidence(
-            n, b, source, n_ref=n_ref, r0=r0, r_min=r_min, a_ref=a_ref
+            n,
+            b,
+            source,
+            n_ref=n_ref,
+            r0=r0,
+            r_min=r_min,
+            a_ref=a_ref,
+            visibility=None if use_cn_flag else v,
+            use_cn=use_cn_flag,
         )
-    return cs, ns
+    if return_visibility:
+        return cs, ns, vs, cas
+    return cs, ns, cas

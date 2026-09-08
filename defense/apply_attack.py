@@ -545,7 +545,7 @@ def replace_init_with_attack(frames, init_override, detector, multi_frame_case):
         boxes, scores = ov
         b, p = pack_dets(boxes, scores)
         frame = multi_frame_case[fr.frame_id]
-        c, n = _c_init(
+        c, n, v, ca = _c_init(
             b,
             frame,
             detector.ego_id,
@@ -555,7 +555,7 @@ def replace_init_with_attack(frames, init_override, detector, multi_frame_case):
             detector.r0,
             detector.r_min,
         )
-        init = SourceResult("init", b, p, c, n)
+        init = SourceResult("init", b, p, c, n, v, ca)
         if detector.score_thres is not None:
             init = init.filter_by_score(detector.score_thres)
         fr.init = init

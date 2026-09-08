@@ -2,8 +2,11 @@
 
 No global W_trust. P0 uses the timeout midpoint 0.5 as a prior (scheme §7.2).
 Spatial evidence is Ego-only:
-  hit  → +κ_pos · ψ(Q_ego) · w(v),  w(v)=1+σ((0.5−v)/τ)
+  hit  → +κ_pos · ψ(Q_buf) · w(v),  w(v)=1+σ((0.5−v)/τ)
   miss → −κ_neg · v
+where Q_buf = P·C_abs (not P·C). Full C = C_abs·V is for gating Q=P·C;
+buffer keeps geometric v in w(v)/e_- so V is not multiplied twice into ψ.
+
 Hard P≥score_thres still gates Certain/pool. Buffer may also match soft Ego
 (θ_soft ≤ P < score_thres) to existing watches; soft Ego never births a watch
 and never enters Certain. UAV/Init never add positive evidence.
@@ -64,10 +67,9 @@ def phi_ego(q_ego: float, q_ref: float = Q_L, tau: float = TAU) -> float:
 
 
 def psi_ego(q_ego: float, q_ref: float = Q_L, tau: float = TAU) -> float:
-    """ψ(Q_ego) = 1 - φ(Q_ego) = σ((Q_ego - Q_l) / τ).
+    """ψ(Q) = 1 - φ(Q) = σ((Q - Q_l) / τ).
 
-    Ego 检测质量越高 ψ 越大；低 Q / 无 Ego 时 ψ→0，正证据减弱。
-    Q = P·C already includes C; do not multiply C again.
+    Buffer passes Q = P·C_abs (see obj_q_buf_ego). Do not feed P·C_abs·V here.
     """
     return 1.0 - phi_ego(q_ego, q_ref=q_ref, tau=tau)
 
@@ -83,7 +85,25 @@ def occ_boost(v: float, tau: float = TAU, v0: float = V_PIVOT) -> float:
 
 
 def obj_q_ego(obj) -> float:
+    """Gate Q_ego = P·C (full C); used only if buffer abs-Q unavailable."""
     return float(getattr(obj, "q_ego", 0.0) or 0.0)
+
+
+def obj_q_buf_ego(obj, mode: str = "pc_abs") -> float:
+    """Tentative evidence Q.
+
+    pc_abs (default): P·C_abs  (V stays in w(v)/e_-)
+    p: P only (ablation: drop C from buffer evidence)
+    """
+    p = float(getattr(obj, "p_ego", 0.0) or 0.0)
+    m = str(mode or "pc_abs").lower()
+    if m in ("p", "p_only", "score"):
+        return float(p)
+    ca = getattr(obj, "c_abs_ego", None)
+    if ca is not None:
+        return float(p) * float(ca)
+    c = float(getattr(obj, "c_ego", 0.0) or 0.0)
+    return float(p) * float(c)
 
 
 def obj_q_uav(obj) -> float:
@@ -144,7 +164,7 @@ def spatial_evidence(
 ) -> float:
     """Spatial log-odds increment (Ego-only).
 
-    Ego hit (hard or soft): +κ_pos · ψ(Q) · w(v).
+    Ego hit (hard or soft): +κ_pos · ψ(Q) · w(v),  Q = P·C_abs.
     Ego miss (unmatched, or matched UAV/Init only): −κ_neg · v.
     """
     vv = float(np.clip(v, 0.0, 1.0))
@@ -396,6 +416,7 @@ class TentativeBuffer:
         p_min: float = P_MIN,
         k_atk: int = K_ATK,
         v_min: float = V_MIN,
+        buf_q_mode: str = "pc_abs",
     ):
         self.q_l = float(q_l)
         self.theta_iou = float(theta_iou)
@@ -408,6 +429,7 @@ class TentativeBuffer:
         self.p_min = float(p_min)
         self.k_atk = int(k_atk)
         self.v_min = float(v_min)
+        self.buf_q_mode = str(buf_q_mode or "pc_abs")
         self.reset()
 
     def reset(self) -> None:
@@ -422,7 +444,7 @@ class TentativeBuffer:
         self, obj, frame_id: int = 0, ego=None, uav=None, init=None
     ) -> BufferEntry:
         st = strength(source_q(obj), q_ref=self.q_l, p_min=self.p_min)
-        q_ego = obj_q_ego(obj)
+        q_ego = obj_q_buf_ego(obj, mode=self.buf_q_mode)
         q_collab = obj_q_collab(obj)
         # 0.5 is the same pivot as timeout (P <= 0.5), not a new threshold.
         half = 0.5
@@ -638,7 +660,7 @@ class TentativeBuffer:
                     continue
                 curr = _meas_traj(entry, obj, frame_id, obj.box)
                 if int(obj.d_ego) == 1:
-                    entry.q_ego = obj_q_ego(obj)
+                    entry.q_ego = obj_q_buf_ego(obj, mode=self.buf_q_mode)
                 if int(obj.d_uav) == 1:
                     entry.q_uav = obj_q_uav(obj)
                 if obj.state == CERTAIN:
