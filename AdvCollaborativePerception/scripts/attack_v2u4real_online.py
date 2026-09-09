@@ -368,30 +368,52 @@ def run_spoof_early_points(perception, dataset, multi_frame_case, frame_ids,
         src0 = None
     else:
         if clean is None or len(clean) == 0 or len(clean[0][0]) == 0:
-            log("[early-spoof] 需要干净检测")
+            log("[early-spoof] 无干净检测，回退 danger 幽灵注入")
+            ghost = "danger"
             bbox_ego = _select_spoof_ghost(multi_frame_case, frame_ids, ego_id)
-            return (
-                [(np.zeros((0, 7)), np.zeros((0,))) for _ in frame_ids],
-                [bbox_ego.copy() for _ in frame_ids],
-                multi_frame_case,
-            )
-        bbox_eval0, src0, dist = _select_early_ghost(
-            clean, multi_frame_case[frame_ids[0]][ego_id]["lidar"])
-        log("  幽灵 ({:.1f},{:.1f}) ← 检出车平移 {:.0f}m".format(
-            bbox_eval0[0], bbox_eval0[1], dist))
-        ego0_pose = np.asarray(multi_frame_case[frame_ids[0]][ego_id]["lidar_pose"])
-        cloud_world = np.zeros((0, 3))
-        inten0 = None
-        cloud0, inten0, n0 = _extract_box_cloud(
-            multi_frame_case[frame_ids[0]][ego_id]["lidar"], src0)
-        if n0 >= 15:
-            cloud_eval0 = _warp_cloud(cloud0, src0, bbox_eval0)
-            cloud_world = pcd_sensor_to_map(cloud_eval0, ego0_pose)
+            positions = _ghost_in_attacker_frame(
+                bbox_ego, multi_frame_case, frame_ids, ego_id, att_id,
+                opencood=True, snap_z=False)
+            attacker = LidarSpoofEarlyAttacker(dataset, dense=dense, sync=sync)
+            attacked_case, _ = attacker.run(multi_frame_case, {
+                "frame_ids": frame_ids,
+                "attacker_vehicle_id": att_id,
+                "positions": positions,
+            })
+            dist = None
+            src0 = None
         else:
-            log("[early-spoof] 源车点过少 n={}".format(n0))
-        ghost_world = bbox_sensor_to_map(bbox_eval0, ego0_pose)
-        bbox_ego = bbox_eval0
-        attacked_case = copy.deepcopy(multi_frame_case)
+            bbox_eval0, src0, dist = _select_early_ghost(
+                clean, multi_frame_case[frame_ids[0]][ego_id]["lidar"])
+            log("  幽灵 ({:.1f},{:.1f}) ← 检出车平移 {:.0f}m".format(
+                bbox_eval0[0], bbox_eval0[1], dist))
+            ego0_pose = np.asarray(multi_frame_case[frame_ids[0]][ego_id]["lidar_pose"])
+            cloud_world = np.zeros((0, 3))
+            inten0 = None
+            cloud0, inten0, n0 = _extract_box_cloud(
+                multi_frame_case[frame_ids[0]][ego_id]["lidar"], src0)
+            if n0 >= 15:
+                cloud_eval0 = _warp_cloud(cloud0, src0, bbox_eval0)
+                cloud_world = pcd_sensor_to_map(cloud_eval0, ego0_pose)
+            else:
+                log("[early-spoof] 源车点过少 n={}，改 danger 注入".format(n0))
+                ghost = "danger"
+                bbox_ego = _select_spoof_ghost(multi_frame_case, frame_ids, ego_id)
+                positions = _ghost_in_attacker_frame(
+                    bbox_ego, multi_frame_case, frame_ids, ego_id, att_id,
+                    opencood=True, snap_z=False)
+                attacker = LidarSpoofEarlyAttacker(dataset, dense=dense, sync=sync)
+                attacked_case, _ = attacker.run(multi_frame_case, {
+                    "frame_ids": frame_ids,
+                    "attacker_vehicle_id": att_id,
+                    "positions": positions,
+                })
+                dist = None
+                src0 = None
+            if ghost != "danger":
+                ghost_world = bbox_sensor_to_map(bbox_eval0, ego0_pose)
+                bbox_ego = bbox_eval0
+                attacked_case = copy.deepcopy(multi_frame_case)
 
     attacked = []
     ghosts = []
@@ -583,14 +605,124 @@ def run_split_views(perception, multi_frame_case, frame_ids, ego_id, att_id):
     return ego_only, uav_only
 
 
+def _oid_is_car(oid, type_map) -> bool:
+    """Prefer defense.attack_gt.is_car_oid; else obj_type==Car / unknown OK."""
+    try:
+        from defense.attack_gt import is_car_oid as _is_car
+
+        return bool(_is_car(oid, type_map))
+    except Exception:
+        t = (type_map or {}).get(str(oid), "")
+        return (not t) or t == "Car"
+
+
+def _gt_cars_in_ego(frame, ego_id, att_id, min_range=3.0, max_range=75.0):
+    """Ego-frame Car GT boxes in range (for last-resort remove targets)."""
+    rows = []
+    ego = frame[ego_id]
+    types = {}
+    vehicles = (ego.get("params") or {}).get("vehicles") or {}
+    for oid, info in vehicles.items():
+        types[str(oid)] = (info or {}).get("obj_type", "")
+    boxes = np.asarray(ego.get("gt_bboxes", np.zeros((0, 7))))
+    ids = list(ego.get("object_ids") or [])
+    for i, oid in enumerate(ids):
+        if i >= len(boxes):
+            break
+        if not _oid_is_car(oid, types):
+            continue
+        b = np.asarray(boxes[i], dtype=np.float64)[:7]
+        r = float(np.hypot(b[0], b[1]))
+        if r < float(min_range) or r > float(max_range):
+            continue
+        rows.append(b.copy())
+    if att_id in frame:
+        att = frame[att_id]
+        atypes = {}
+        avehicles = (att.get("params") or {}).get("vehicles") or {}
+        for oid, info in avehicles.items():
+            atypes[str(oid)] = (info or {}).get("obj_type", "")
+        aboxes = np.asarray(att.get("gt_bboxes", np.zeros((0, 7))))
+        aids = list(att.get("object_ids") or [])
+        seen = {tuple(np.round(b[:2], 1)) for b in rows}
+        for i, oid in enumerate(aids):
+            if i >= len(aboxes):
+                break
+            if not _oid_is_car(oid, atypes):
+                continue
+            b = _transform_bbox(
+                aboxes[i], att["lidar_pose"], ego["lidar_pose"]
+            )
+            b = np.asarray(b, dtype=np.float64)[:7]
+            r = float(np.hypot(b[0], b[1]))
+            if r < float(min_range) or r > float(max_range):
+                continue
+            key = tuple(np.round(b[:2], 1))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(b.copy())
+    return rows
+
+
+def _force_any_remove_box(
+    clean_boxes,
+    clean_scores,
+    frame,
+    ego_id,
+    att_id,
+    min_range=3.0,
+    prefer_near=None,
+):
+    """Last-resort: any fused det in range, else nearest Car GT. Never None if possible."""
+    boxes = np.asarray(clean_boxes) if clean_boxes is not None else np.zeros((0, 7))
+    scores = (
+        np.asarray(clean_scores).reshape(-1)
+        if clean_scores is not None
+        else np.zeros((0,))
+    )
+    cands = []
+    if boxes.ndim == 2 and boxes.shape[0] > 0:
+        for i in range(len(scores) if len(scores) else len(boxes)):
+            b = boxes[i][:7]
+            r = float(np.hypot(b[0], b[1]))
+            if r < float(min_range) or r > 75.0:
+                continue
+            sc = float(scores[i]) if i < len(scores) else 0.0
+            # Prefer higher score; among equals prefer closer to prefer_near
+            near = 0.0
+            if prefer_near is not None:
+                near = -float(np.hypot(b[0] - prefer_near[0], b[1] - prefer_near[1]))
+            cands.append((sc, near, b.copy()))
+    if cands:
+        cands.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        b = cands[0][2]
+        dbg("[remove] force-det ({:.1f},{:.1f}) score={:.2f}".format(
+            b[0], b[1], cands[0][0]))
+        return b, float(cands[0][0]), "force-det"
+    gts = _gt_cars_in_ego(frame, ego_id, att_id, min_range=min_range)
+    if not gts:
+        return None, 0.0, "none"
+    if prefer_near is not None:
+        gts.sort(
+            key=lambda b: float(np.hypot(b[0] - prefer_near[0], b[1] - prefer_near[1]))
+        )
+    else:
+        gts.sort(key=lambda b: float(np.hypot(b[0], b[1])))
+    b = gts[0]
+    dbg("[remove] force-gt ({:.1f},{:.1f})".format(b[0], b[1]))
+    return b.copy(), 1.0, "force-gt"
+
+
 def _select_remove_target(clean0_boxes, clean0_scores, frame0, ego_id, att_id,
                           require_uav_pts=0, min_range=3.0,
                           ego_only=None, uav_only=None, prefer_uav_gap=False,
-                          max_ego_score=None):
+                          max_ego_score=None, ensure_one=False):
     """选 remove 目标。early+prefer_uav_gap：融合>=0.3、UAV有点，优先「机强车弱」。
 
-    max_ego_score: 若设置，车端分数高于此的目标不当成 UAV-only 可打对象
-    （不再 fallback 到 ego=0.8 的 min-ego）。
+    max_ego_score: 优先跳过车端过强目标；ensure_one=True 时仍逐级回退，
+    保证尽量每帧至少一个目标（机强车弱 → min-ego → 放宽 UAV 点数 →
+    任意融合框 → GT）。
     """
     ego0 = frame0[ego_id]
     att0 = frame0[att_id]
@@ -599,70 +731,118 @@ def _select_remove_target(clean0_boxes, clean0_scores, frame0, ego_id, att_id,
         att_in_ego.append(_transform_bbox(b, att0["lidar_pose"], ego0["lidar_pose"]))
     att_in_ego = np.array(att_in_ego) if len(att_in_ego) else np.zeros((0, 7))
 
-    order = np.argsort(-np.asarray(clean0_scores).reshape(-1))
-    uav_hit = None
-    fallback = None
-    ranked = []
-    ego_strong = []
-    for i in order:
-        box = clean0_boxes[i]
-        dist = float(np.hypot(box[0], box[1]))
-        if dist < min_range or dist > 75.0:
-            continue
-        if float(clean0_scores[i]) < 0.3:
-            continue
-        n_uav, _ = _uav_points_on_ego_box(frame0, ego_id, att_id, box)
-        if require_uav_pts > 0 and n_uav < require_uav_pts:
-            dbg("[remove] 跳过 ({:.1f},{:.1f}) uav_pts={}".format(box[0], box[1], n_uav))
-            continue
-        ego_s = _score_near(ego_only, box)
-        uav_s = _score_near(uav_only, box)
-        # attfuse UAV-only 常检不出俯视目标；用 UAV 点数补「机强」
-        uav_pts_s = min(1.0, float(n_uav) / 80.0)
-        uav_s = max(uav_s, uav_pts_s)
-        util = uav_s - ego_s
-        dbg("[remove] 候选 ({:.1f},{:.1f}) fused={:.2f} ego={:.2f} uav={:.2f} util={:.2f}".format(
-            box[0], box[1], float(clean0_scores[i]), ego_s, uav_s, util))
-        if prefer_uav_gap and util <= 0.05:
-            dbg("[remove] 机弱车强 ({:.1f},{:.1f}) ego={:.2f}".format(box[0], box[1], ego_s))
-            ego_strong.append((-ego_s, n_uav, float(clean0_scores[i]), i, ego_s, uav_s, util))
-            continue
-        ranked.append((util, uav_s, -ego_s, float(clean0_scores[i]), i, ego_s, n_uav))
-        if fallback is None:
-            fallback = i
-        if att_in_ego.shape[0] > 0:
-            dmin = np.min(np.hypot(att_in_ego[:, 0] - box[0], att_in_ego[:, 1] - box[1]))
-            if dmin < 8.0:
-                uav_hit = i
-                if not prefer_uav_gap:
-                    break
-    if prefer_uav_gap:
-        if ranked:
-            ranked.sort(reverse=True)
-            util, uav_s, _, fused, pick, ego_s, n_uav = ranked[0]
-            dbg("[remove] 选 uav-over-ego util={:.2f} xy=({:.1f},{:.1f})".format(
-                util, float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
-            return clean0_boxes[pick], fused, "uav-over-ego"
-        if ego_strong:
-            ego_strong.sort(reverse=True)
-            _, n_uav, fused, pick, ego_s, uav_s, util = ego_strong[0]
-            if max_ego_score is not None and float(ego_s) > float(max_ego_score):
-                dbg("[remove] 跳过 min-ego ego={:.2f} > {:.2f} xy=({:.1f},{:.1f})".format(
-                    ego_s, float(max_ego_score),
-                    float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
-            else:
-                dbg("[remove] 选 min-ego ego={:.2f} xy=({:.1f},{:.1f})".format(
-                    ego_s, float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
-                return clean0_boxes[pick], fused, "min-ego"
+    clean0_boxes = np.asarray(clean0_boxes) if clean0_boxes is not None else np.zeros((0, 7))
+    clean0_scores = np.asarray(clean0_scores).reshape(-1) if clean0_scores is not None else np.zeros((0,))
+
+    def _collect(req_pts, enforce_max_ego):
+        order = np.argsort(-clean0_scores) if len(clean0_scores) else np.arange(0)
+        uav_hit = None
+        fallback = None
+        ranked = []
+        ego_strong = []
+        weak_uav = []  # dets that fail UAV-pts but otherwise OK
+        for i in order:
+            if i >= len(clean0_boxes):
+                continue
+            box = clean0_boxes[i]
+            dist = float(np.hypot(box[0], box[1]))
+            if dist < min_range or dist > 75.0:
+                continue
+            if i < len(clean0_scores) and float(clean0_scores[i]) < 0.3:
+                continue
+            n_uav, _ = _uav_points_on_ego_box(frame0, ego_id, att_id, box)
+            if req_pts > 0 and n_uav < req_pts:
+                weak_uav.append((n_uav, float(clean0_scores[i]) if i < len(clean0_scores) else 0.0, i))
+                dbg("[remove] 跳过 ({:.1f},{:.1f}) uav_pts={}".format(box[0], box[1], n_uav))
+                continue
+            ego_s = _score_near(ego_only, box)
+            uav_s = _score_near(uav_only, box)
+            uav_pts_s = min(1.0, float(n_uav) / 80.0)
+            uav_s = max(uav_s, uav_pts_s)
+            util = uav_s - ego_s
+            fused = float(clean0_scores[i]) if i < len(clean0_scores) else 0.0
+            dbg("[remove] 候选 ({:.1f},{:.1f}) fused={:.2f} ego={:.2f} uav={:.2f} util={:.2f}".format(
+                box[0], box[1], fused, ego_s, uav_s, util))
+            if prefer_uav_gap and util <= 0.05:
+                dbg("[remove] 机弱车强 ({:.1f},{:.1f}) ego={:.2f}".format(box[0], box[1], ego_s))
+                ego_strong.append((-ego_s, n_uav, fused, i, ego_s, uav_s, util))
+                continue
+            ranked.append((util, uav_s, -ego_s, fused, i, ego_s, n_uav))
+            if fallback is None:
+                fallback = i
+            if att_in_ego.shape[0] > 0:
+                dmin = np.min(np.hypot(att_in_ego[:, 0] - box[0], att_in_ego[:, 1] - box[1]))
+                if dmin < 8.0:
+                    uav_hit = i
+                    if not prefer_uav_gap:
+                        break
+        if prefer_uav_gap:
+            if ranked:
+                ranked.sort(reverse=True)
+                util, uav_s, _, fused, pick, ego_s, n_uav = ranked[0]
+                dbg("[remove] 选 uav-over-ego util={:.2f} xy=({:.1f},{:.1f})".format(
+                    util, float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
+                return clean0_boxes[pick], fused, "uav-over-ego"
+            if ego_strong:
+                ego_strong.sort(reverse=True)
+                _, n_uav, fused, pick, ego_s, uav_s, util = ego_strong[0]
+                if enforce_max_ego and max_ego_score is not None and float(ego_s) > float(max_ego_score):
+                    dbg("[remove] 暂缓 min-ego ego={:.2f} > {:.2f} xy=({:.1f},{:.1f})".format(
+                        ego_s, float(max_ego_score),
+                        float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
+                else:
+                    dbg("[remove] 选 min-ego ego={:.2f} xy=({:.1f},{:.1f})".format(
+                        ego_s, float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
+                    return clean0_boxes[pick], fused, "min-ego"
+            return None, 0.0, "none", ego_strong, weak_uav
+        pick = uav_hit if uav_hit is not None else fallback
+        if pick is None:
+            return None, 0.0, "none", ego_strong, weak_uav
+        src = "uav-visible" if uav_hit is not None else "ego-det-fallback"
+        if req_pts > 0:
+            src = "uav-points"
+        return clean0_boxes[pick], float(clean0_scores[pick]) if pick < len(clean0_scores) else 0.0, src, ego_strong, weak_uav
+
+    # Pass 1: strict
+    out = _collect(require_uav_pts, enforce_max_ego=True)
+    if len(out) == 3:
+        return out
+    box, sc, src, ego_strong, weak_uav = out
+    if box is not None:
+        return box, sc, src
+
+    if not ensure_one:
         dbg("[remove] 无可打目标")
         return None, 0.0, "none"
-    pick = uav_hit if uav_hit is not None else fallback
-    if pick is None:
-        return None, 0.0, "none"
-    src = "uav-visible" if uav_hit is not None else "ego-det-fallback"
+
+    # Pass 2: allow ego-strong min-ego (ignore max_ego_score)
+    if ego_strong:
+        ego_strong.sort(reverse=True)
+        _, n_uav, fused, pick, ego_s, uav_s, util = ego_strong[0]
+        dbg("[remove] ensure min-ego-strong ego={:.2f} xy=({:.1f},{:.1f})".format(
+            ego_s, float(clean0_boxes[pick][0]), float(clean0_boxes[pick][1])))
+        return clean0_boxes[pick], fused, "min-ego-strong"
+
+    # Pass 3: relax UAV point requirement
     if require_uav_pts > 0:
-        src = "uav-points"
-    return clean0_boxes[pick], float(clean0_scores[pick]), src
+        out2 = _collect(0, enforce_max_ego=False)
+        if len(out2) == 3:
+            return out2
+        box2, sc2, src2, ego_strong2, _ = out2
+        if box2 is not None:
+            dbg("[remove] ensure relax-uav-pts src={}".format(src2))
+            return box2, sc2, src2 + "+relax-pts"
+        if ego_strong2:
+            ego_strong2.sort(reverse=True)
+            _, _, fused, pick, ego_s, _, _ = ego_strong2[0]
+            dbg("[remove] ensure min-ego after relax-pts ego={:.2f}".format(ego_s))
+            return clean0_boxes[pick], fused, "min-ego-relax-pts"
+
+    # Pass 4: any fused det / GT
+    box3, sc3, src3 = _force_any_remove_box(
+        clean0_boxes, clean0_scores, frame0, ego_id, att_id, min_range=min_range
+    )
+    return box3, sc3, src3
 
 
 def _erase_box_points(lidar, bbox, pad=0.5):
@@ -735,9 +915,12 @@ def _erase_uav_overhead(lidar, bbox, pad_xy=2.0, pad_z=1.5, fill_n=32):
 def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
                          require_uav_pts=0, min_range=3.0, hold_position=True,
                          ego_only_list=None, uav_only_list=None, prefer_uav_gap=False,
-                         max_ego_score=None):
-    """选 remove 目标并按帧跟踪，对齐中间融合：能跟就跟，跟丢就换当前帧能打的检测。
-    hold_position=False（early）：跟丢且本帧没有可打检测就跳过，不把旧世界坐标继续当目标。
+                         max_ego_score=None, ensure_every_frame=True):
+    """选 remove 目标并按帧跟踪。
+
+    ensure_every_frame=True（默认）: 每帧至少打一个目标。优先机强车弱 /
+    跟踪；跟丢则逐级放宽；仍没有则 force-det / GT。只有场景里完全没有
+    融合框也没有 Car GT 时才会 None。
     """
     if clean is None or len(clean) == 0:
         dbg("[remove] 无 clean 检测")
@@ -747,6 +930,7 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
     pred_ego = None
     target_att, target_ego = [], []
     reset_perturbation = [False] * len(multi_frame_case)
+    n_forced = 0
     for fi, f in enumerate(frame_ids):
         att = multi_frame_case[f][att_id]
         ego = multi_frame_case[f][ego_id]
@@ -768,9 +952,14 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
                     continue
                 n_uav, _ = _uav_points_on_ego_box(
                     multi_frame_case[f], ego_id, att_id, boxes[j])
-                if require_uav_pts > 0 and n_uav < require_uav_pts:
+                # Tracking snap: prefer UAV pts, but still allow when ensuring
+                if require_uav_pts > 0 and n_uav < require_uav_pts and not ensure_every_frame:
                     continue
-                if max_ego_score is not None and ego_only_list is not None:
+                if (
+                    max_ego_score is not None
+                    and ego_only_list is not None
+                    and not ensure_every_frame
+                ):
                     eo = ego_only_list[fi]
                     if _score_near(eo, boxes[j]) > float(max_ego_score):
                         continue
@@ -785,13 +974,15 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
                 boxes, scores, multi_frame_case[f], ego_id, att_id,
                 require_uav_pts=require_uav_pts, min_range=min_range,
                 ego_only=eo, uav_only=uo, prefer_uav_gap=prefer_uav_gap,
-                max_ego_score=max_ego_score)
-            if new_box is not None and new_score >= 0.3:
+                max_ego_score=max_ego_score, ensure_one=bool(ensure_every_frame),
+            )
+            if new_box is not None and (
+                float(new_score) >= 0.3 or str(new_src).startswith("force")
+            ):
                 n_new, _ = _uav_points_on_ego_box(
                     multi_frame_case[f], ego_id, att_id, new_box)
                 take = False
                 if new_src == "uav-over-ego":
-                    # 机强车弱优先：即使已经跟了车强目标也改打
                     if chosen is None:
                         take = True
                     else:
@@ -812,6 +1003,8 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
                     n_uav = n_new
                     if new_src == "uav-over-ego":
                         snapped = False
+                    if str(new_src).startswith("force") or "relax" in str(new_src) or "strong" in str(new_src):
+                        n_forced += 1
         if chosen is None:
             if hold_position and world_tgt is not None:
                 chosen = bbox_map_to_sensor(world_tgt, ego["lidar_pose"])
@@ -819,11 +1012,27 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
                     multi_frame_case[f], ego_id, att_id, chosen)
                 dbg("[remove] frame {} 沿用预测 ({:.1f},{:.1f})".format(
                     f, chosen[0], chosen[1]))
+            elif ensure_every_frame:
+                forced, fsc, fsrc = _force_any_remove_box(
+                    boxes, scores, multi_frame_case[f], ego_id, att_id,
+                    min_range=min_range, prefer_near=pred_ego,
+                )
+                if forced is not None:
+                    chosen = forced
+                    n_forced += 1
+                    dbg("[remove] frame {} {} ({:.1f},{:.1f})".format(
+                        f, fsrc, chosen[0], chosen[1]))
+                else:
+                    dbg("[remove] frame {} skip (no det/GT)".format(f))
+                    target_ego.append(None)
+                    target_att.append(None)
+                    if world_tgt is not None:
+                        pred_ego = bbox_map_to_sensor(world_tgt, ego["lidar_pose"])
+                    continue
             else:
                 dbg("[remove] frame {} skip".format(f))
                 target_ego.append(None)
                 target_att.append(None)
-                # 跟踪不重置：下一帧还能吸回同一目标（中间融合跟丢也不换坐标系原点）
                 if world_tgt is not None:
                     pred_ego = bbox_map_to_sensor(world_tgt, ego["lidar_pose"])
                 continue
@@ -844,32 +1053,56 @@ def _plan_remove_targets(multi_frame_case, frame_ids, ego_id, att_id, clean,
     n_skip = len(target_ego) - n_attack
     first = next(t for t in target_ego if t is not None)
     if not VERBOSE:
-        log("  目标 ({:.1f},{:.1f}) | 攻击 {} 帧 / 跳过 {} 帧".format(
-            first[0], first[1], n_attack, n_skip))
+        log("  目标 ({:.1f},{:.1f}) | 攻击 {} 帧 / 跳过 {} 帧 | 回退选 {}".format(
+            first[0], first[1], n_attack, n_skip, n_forced))
     return target_att, target_ego, reset_perturbation
 
 
 def run_remove_early_points(perception, dataset, multi_frame_case, frame_ids,
                             ego_id, att_id, dense=3, also_ego=False, clean=None,
-                            remove_mode="box"):
+                            remove_mode="box", remove_select="ensure"):
     """点云级 remove。
 
     remove_mode:
       - box（默认）：UAV 俯视 OBB 硬删 + 地面填充，不用车载 AdvShape
       - adv：Zhang 射线 / AdvShape，再补一层框内删点
+
+    remove_select（选目标策略）:
+      - ensure（默认）：每帧至少 1 个目标；机强车弱优先，选不到则逐级回退
+        （含 ego>0.35 / GT force）
+      - prefer：宽松。融合 P≥0.3、距离≥8m、UAV 框内点数≥15 即可；
+        **不要求**机强车弱，**不筛** ego-only>0.35。可跳帧；
+        跟踪沿用；不 force GT。UAV 点数不够则该帧 skip。
     """
     remove_mode = str(remove_mode or "box").lower()
     if remove_mode not in ("box", "adv"):
         raise ValueError("remove_mode must be 'box' or 'adv', got {!r}".format(remove_mode))
+    remove_select = str(remove_select or "ensure").lower()
+    if remove_select not in ("ensure", "prefer"):
+        raise ValueError(
+            "remove_select must be 'ensure' or 'prefer', got {!r}".format(remove_select)
+        )
+    ensure_every = remove_select == "ensure"
     dbg("计算 ego-only / UAV-only ...")
     ego_only_list, uav_only_list = run_split_views(
         perception, multi_frame_case, frame_ids, ego_id, att_id)
-    target_att, target_ego, _ = _plan_remove_targets(
-        multi_frame_case, frame_ids, ego_id, att_id, clean,
-        require_uav_pts=15, min_range=8.0,
-        hold_position=(remove_mode == "box"),
-        ego_only_list=ego_only_list, uav_only_list=uav_only_list,
-        prefer_uav_gap=True, max_ego_score=0.35)
+    if ensure_every:
+        target_att, target_ego, _ = _plan_remove_targets(
+            multi_frame_case, frame_ids, ego_id, att_id, clean,
+            require_uav_pts=15, min_range=8.0,
+            hold_position=True,
+            ego_only_list=ego_only_list, uav_only_list=uav_only_list,
+            prefer_uav_gap=True, max_ego_score=0.35,
+            ensure_every_frame=True)
+    else:
+        # prefer: no UAV-over-ego gate, no max_ego_score; skip if no UAV-visible fused det
+        target_att, target_ego, _ = _plan_remove_targets(
+            multi_frame_case, frame_ids, ego_id, att_id, clean,
+            require_uav_pts=15, min_range=8.0,
+            hold_position=True,
+            ego_only_list=ego_only_list, uav_only_list=uav_only_list,
+            prefer_uav_gap=False, max_ego_score=None,
+            ensure_every_frame=False)
     if target_att is None:
         return None, None, None
 
@@ -883,11 +1116,12 @@ def run_remove_early_points(perception, dataset, multi_frame_case, frame_ids,
             "attacker_vehicle_id": att_id,
             "bboxes": positions,
         })
-        log("[early-remove] mode=adv (Zhang ray+AdvShape)")
+        log("[early-remove] mode=adv (Zhang ray+AdvShape) select={}".format(remove_select))
     else:
         attacked_case = copy.deepcopy(multi_frame_case)
         infos = [{} for _ in frame_ids]
-        log("[early-remove] mode=box (UAV overhead OBB delete, no car mesh)")
+        log("[early-remove] mode=box (UAV overhead OBB delete, no car mesh) select={}".format(
+            remove_select))
 
     attacked = []
     frame_rows = []

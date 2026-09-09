@@ -5,6 +5,7 @@ Ego / UAV use dedicated late PointPillars; Init uses --model (attfuse/...).
 Usage (from this repo root, or any cwd):
     python scripts/run_three_source.py --model attfuse --case 0
     python scripts/run_three_source.py --model attfuse --case 0 --score_thres 0.3 -v
+    python scripts/run_three_source.py --model attfuse --case 0 --det_score_thres 0.05
     python scripts/run_three_source.py --model where2comm --case 1 --save out.json
 
 Per-scene checkpoints (resume after crash):
@@ -68,7 +69,18 @@ from defense.apply_attack import (  # noqa: E402
     primary_target,
     replace_init_with_attack,
 )
-from defense.buffer import THETA_CONFIRM  # noqa: E402
+from defense.buffer import (  # noqa: E402
+    BETA_V,
+    GAMMA_R,
+    KAPPA_NEG,
+    KAPPA_POS,
+    TAU,
+    THETA_CONFIRM,
+    THETA_REJECT,
+    T_TIMEOUT,
+)
+from defense.occlusion import K_ATK, V_MIN  # noqa: E402
+from defense.trust_pool import POOL_K  # noqa: E402
 from defense.gating import (  # noqa: E402
     Q_H,
     Q_L,
@@ -120,16 +132,32 @@ def _ckpt_fingerprint(args) -> dict:
         "mode": args.mode,
         "level": args.level,
         "score_thres": float(args.score_thres),
+        "theta_p": float(getattr(args, "theta_p", 0) or 0),
+        "theta_soft": float(getattr(args, "theta_soft", 0) or 0),
+        "bev_matcher": str(getattr(args, "bev_matcher", "") or ""),
+        "bev_tau": float(getattr(args, "bev_tau", 0.5) or 0.5),
+        "det_score_thres": float(getattr(args, "det_score_thres", 0.2) or 0.2),
         "defense": args.defense,
         "n_objects": int(args.n_objects),
         "early_remove_mode": args.early_remove_mode,
+        "remove_select": str(getattr(args, "remove_select", "ensure") or "ensure"),
         "iters": int(getattr(args, "iters", 0) or 0),
         "also_ego": bool(args.also_ego),
         "q_h": float(getattr(args, "q_h", 0) or 0),
         "q_l": float(getattr(args, "q_l", 0) or 0),
-        "gate_q_mode": str(getattr(args, "gate_q_mode", "pc") or "pc"),
+        "gate_q_mode": str(getattr(args, "gate_q_mode", "p") or "p"),
         "theta_confirm": float(getattr(args, "theta_confirm", 0.7) or 0.7),
-        "buf_q_mode": str(getattr(args, "buf_q_mode", "pc_abs") or "pc_abs"),
+        "theta_reject": float(getattr(args, "theta_reject", 0.1) or 0.1),
+        "t_timeout": int(getattr(args, "t_timeout", 10) or 10),
+        "kappa_pos": float(getattr(args, "kappa_pos", 1.4) or 1.4),
+        "kappa_neg": float(getattr(args, "kappa_neg", 1.0) or 1.0),
+        "k_atk": int(getattr(args, "k_atk", 10) or 10),
+        "pool_k": int(getattr(args, "pool_k", 3) or 3),
+        "v_min": float(getattr(args, "v_min", 0.25) or 0.25),
+        "beta_v": float(getattr(args, "beta_v", 0.5) or 0.5),
+        "gamma_r": float(getattr(args, "gamma_r", 0.5) or 0.5),
+        "tau": float(getattr(args, "tau", 0.1) or 0.1),
+        "buf_q_mode": str(getattr(args, "buf_q_mode", "p") or "p"),
     }
 
 
@@ -297,7 +325,7 @@ def load_fusion_model(name: str) -> OpencoodPerception:
     return perc
 
 
-def load_late_pointpillar(model_dir: str) -> OpencoodPerception:
+def load_late_pointpillar(model_dir: str, score_threshold=None) -> OpencoodPerception:
     if not os.path.isdir(model_dir):
         raise SystemExit("late PointPillar dir not found: {}".format(model_dir))
     print("[load] late PointPillar {} ...".format(model_dir), flush=True)
@@ -308,9 +336,10 @@ def load_late_pointpillar(model_dir: str) -> OpencoodPerception:
         opencood_root=V2U4REAL_ROOT,
         root_dir=train_dir(),
         validate_dir=val_dir(),
+        score_threshold=score_threshold,
     )
-    print("[load] late PointPillar {}  only_cav_id={!r}".format(
-        model_dir, getattr(perc.dataset, "only_cav_id", None)), flush=True)
+    print("[load] late PointPillar {}  only_cav_id={!r}  det_score={}".format(
+        model_dir, getattr(perc.dataset, "only_cav_id", None), score_threshold), flush=True)
     return perc
 
 
@@ -327,13 +356,17 @@ def cuda_empty_cache(tag: str = "") -> None:
         pass
 
 
-def ensure_late_perceptions(detector, ego_ckpt: str, uav_ckpt: str) -> None:
+def ensure_late_perceptions(detector, ego_ckpt: str, uav_ckpt: str, score_threshold=None) -> None:
     """Load ego/uav PointPillars once, after intermediate attack if deferred."""
     if detector.ego_perception is None:
         cuda_empty_cache("before ego PointPillar")
-        detector.ego_perception = load_late_pointpillar(ego_ckpt)
+        detector.ego_perception = load_late_pointpillar(
+            ego_ckpt, score_threshold=score_threshold
+        )
     if detector.uav_perception is None:
-        detector.uav_perception = load_late_pointpillar(uav_ckpt)
+        detector.uav_perception = load_late_pointpillar(
+            uav_ckpt, score_threshold=score_threshold
+        )
 
 
 def overlay_pool_states(gate_maps, pool) -> None:
@@ -348,7 +381,7 @@ def overlay_pool_states(gate_maps, pool) -> None:
             lab = str(lab)
             if lab == "certain":
                 cur = str(dest.get(int(i), "") or "")
-                if cur.startswith("ambiguous -> certain") or cur.startswith("tentative -> certain"):
+                if cur.startswith("ambiguous -> certain") or cur.startswith("tentative -> certain") or cur.startswith("bev -> certain"):
                     continue
                 dest[int(i)] = "certain"
             elif lab == "pool":
@@ -480,14 +513,26 @@ def main():
     ap.add_argument(
         "--score_thres",
         type=float,
-        default=0.5,
-        help="drop boxes with P below this before gating (attack eval often 0.3)",
+        default=0.3,
+        help="UAV/Init D=1 floor (default 0.3); Ego uses --theta_soft",
     )
     ap.add_argument(
         "--theta_p",
         type=float,
         default=None,
-        help="§4/§5.1 D=1 threshold on P (default: same as --score_thres; scheme θ_P=0.5)",
+        help="Certain / UAV-Init D=1 on P (default: same as --score_thres = 0.3)",
+    )
+    ap.add_argument(
+        "--theta_soft",
+        type=float,
+        default=0.05,
+        help="Ego enter / Ambiguous lower bound (default 0.05)",
+    )
+    ap.add_argument(
+        "--det_score_thres",
+        type=float,
+        default=0.2,
+        help="OpenCOOD NMS score_threshold for late Ego/UAV PointPillar: 0.2 / 0.15 / 0.1 / 0.05",
     )
     ap.add_argument(
         "--n_ref",
@@ -547,20 +592,20 @@ def main():
         "--q_h",
         type=float,
         default=Q_H,
-        help="§5.1 Certain threshold on Q_ego=P·C (default Q_H={:.2f})".format(Q_H),
+        help="§5.1 Certain threshold on P (default Q_H={:.2f})".format(Q_H),
     )
     ap.add_argument(
         "--q_l",
         type=float,
         default=Q_L,
-        help="§5.1 Ambiguous lower bound on Q_ego (default Q_L={:.2f}; also buffer ψ ref)".format(Q_L),
+        help="§5.1 Ambiguous lower bound on P (default Q_L={:.2f})".format(Q_L),
     )
     ap.add_argument(
         "--gate_q_mode",
         type=str,
-        default="pc",
+        default="p",
         choices=["pc", "p"],
-        help="spatial gate score: pc=P·C (default) or p=P only (drop C/V from partition)",
+        help="spatial gate score: p=P only (default) or pc=P·C",
     )
     ap.add_argument(
         "--theta_confirm",
@@ -569,11 +614,89 @@ def main():
         help="Tentative confirm threshold on posterior p (default THETA_CONFIRM=0.7)",
     )
     ap.add_argument(
+        "--theta_reject",
+        type=float,
+        default=None,
+        help="Tentative reject threshold (default THETA_REJECT=0.1)",
+    )
+    ap.add_argument(
+        "--t_timeout",
+        type=int,
+        default=None,
+        help="Tentative timeout age T1 (default T_TIMEOUT=10)",
+    )
+    ap.add_argument(
+        "--kappa_pos",
+        type=float,
+        default=None,
+        help="Positive Ego evidence strength κ+ (default KAPPA_POS=1.4)",
+    )
+    ap.add_argument(
+        "--kappa_neg",
+        type=float,
+        default=None,
+        help="Negative Ego miss strength κ- (default KAPPA_NEG=1.0)",
+    )
+    ap.add_argument(
+        "--k_atk",
+        type=int,
+        default=None,
+        help="Attack coast / atk budget K_atk (default K_ATK=10)",
+    )
+    ap.add_argument(
+        "--pool_k",
+        type=int,
+        default=None,
+        help="Pool track max miss K (default POOL_K=3)",
+    )
+    ap.add_argument(
+        "--v_min",
+        type=float,
+        default=None,
+        help="Visibility floor V_min (default V_MIN=0.25)",
+    )
+    ap.add_argument(
+        "--beta_v",
+        type=float,
+        default=None,
+        help="Birth P0 visibility weight β (default BETA_V=0.5)",
+    )
+    ap.add_argument(
+        "--gamma_r",
+        type=float,
+        default=None,
+        help="Birth P0 range weight γ (default GAMMA_R=0.5)",
+    )
+    ap.add_argument(
+        "--tau",
+        type=float,
+        default=None,
+        help="ψ / occ_boost softness τ (default TAU=0.1)",
+    )
+    ap.add_argument(
         "--buf_q_mode",
         type=str,
-        default="pc_abs",
+        default="p",
         choices=["pc_abs", "p"],
-        help="buffer ψ score: pc_abs=P·C_abs (default) or p=P only",
+        help="buffer ψ score: p=P only (default) or pc_abs=P·C_abs",
+    )
+    ap.add_argument(
+        "--bev_matcher",
+        type=str,
+        default="",
+        help="path to trained BevLocalMatcher ckpt; empty = off",
+    )
+    ap.add_argument(
+        "--bev_tau",
+        type=float,
+        default=0.5,
+        help="promote UAV box to Certain if matcher S >= this (default 0.5)",
+    )
+    ap.add_argument(
+        "--bev_c_min",
+        type=float,
+        default=0.2,
+        help="min UAV C to allow BEV promotion (default 0.2)",
     )
     ap.add_argument(
         "--mode",
@@ -608,6 +731,14 @@ def main():
         choices=["box", "adv"],
         default="box",
         help="early remove: box=UAV overhead OBB delete; adv=Zhang ray+AdvShape",
+    )
+    ap.add_argument(
+        "--remove_select",
+        choices=["ensure", "prefer"],
+        default="ensure",
+        help="early remove target policy: "
+             "ensure=≥1 target every frame (UAV-over-ego then fallback); "
+             "prefer=any fused det with UAV pts, no ego-score cap, may skip",
     )
     ap.add_argument("--save", type=str, default=None, help="write JSON dump")
     ap.add_argument(
@@ -662,8 +793,31 @@ def main():
             os.environ["CUDA_VISIBLE_DEVICES"]), flush=True)
     if args.theta_p is None:
         args.theta_p = args.score_thres
+    det_ok = any(abs(float(args.det_score_thres) - x) < 1e-9 for x in (0.2, 0.15, 0.1, 0.05))
+    if not det_ok:
+        raise SystemExit("--det_score_thres must be 0.2, 0.15, 0.1, or 0.05")
     if args.theta_confirm is None:
         args.theta_confirm = float(THETA_CONFIRM)
+    if args.theta_reject is None:
+        args.theta_reject = float(THETA_REJECT)
+    if args.t_timeout is None:
+        args.t_timeout = int(T_TIMEOUT)
+    if args.kappa_pos is None:
+        args.kappa_pos = float(KAPPA_POS)
+    if args.kappa_neg is None:
+        args.kappa_neg = float(KAPPA_NEG)
+    if args.k_atk is None:
+        args.k_atk = int(K_ATK)
+    if args.pool_k is None:
+        args.pool_k = int(POOL_K)
+    if args.v_min is None:
+        args.v_min = float(V_MIN)
+    if args.beta_v is None:
+        args.beta_v = float(BETA_V)
+    if args.gamma_r is None:
+        args.gamma_r = float(GAMMA_R)
+    if args.tau is None:
+        args.tau = float(TAU)
     if args.mode in ("multi_spoof", "mass_remove") and args.level != "intermediate":
         print(
             "[warn] mode={!r} forces --level intermediate".format(args.mode),
@@ -751,12 +905,28 @@ def main():
     uav_perception = None
     if not defer_late:
         print("[load] loading 2 late PointPillars ...", flush=True)
-        ego_perception = load_late_pointpillar(args.ego_ckpt)
-        uav_perception = load_late_pointpillar(args.uav_ckpt)
+        ego_perception = load_late_pointpillar(
+            args.ego_ckpt, score_threshold=args.det_score_thres
+        )
+        uav_perception = load_late_pointpillar(
+            args.uav_ckpt, score_threshold=args.det_score_thres
+        )
     else:
         print(
             "[load] defer ego/uav PointPillars until after {} attack "
             "(saves VRAM during attack)".format(args.level),
+            flush=True,
+        )
+    bev_matcher = None
+    if str(getattr(args, "bev_matcher", "") or "").strip():
+        from defense.bev_matcher import load_matcher
+
+        bev_path = os.path.abspath(args.bev_matcher)
+        bev_matcher, bev_meta = load_matcher(bev_path)
+        print(
+            "[load] BEV matcher {}  tau={}  c_min={}  meta={}".format(
+                bev_path, args.bev_tau, args.bev_c_min, bev_meta
+            ),
             flush=True,
         )
     detector = ThreeSourceDetector(
@@ -776,11 +946,27 @@ def main():
         gate_q_mode=args.gate_q_mode,
         theta_confirm=args.theta_confirm,
         buf_q_mode=args.buf_q_mode,
+        theta_soft=args.theta_soft,
+        bev_matcher=bev_matcher,
+        bev_tau=args.bev_tau,
+        bev_c_min=args.bev_c_min,
+        theta_reject=args.theta_reject,
+        t_timeout=args.t_timeout,
+        kappa_pos=args.kappa_pos,
+        kappa_neg=args.kappa_neg,
+        k_atk=args.k_atk,
+        pool_k=args.pool_k,
+        v_min=args.v_min,
+        beta_v=args.beta_v,
+        gamma_r=args.gamma_r,
+        tau=args.tau,
     )
 
     print(
         "score_thres =", args.score_thres,
         "  theta_p =", args.theta_p,
+        "  theta_soft =", args.theta_soft,
+        "  det_score_thres =", args.det_score_thres,
         "  iou_thres =", args.iou_thres,
         "  n_ref_ego =", args.n_ref,
         "  n_ref_uav =", args.n_ref_uav,
@@ -792,11 +978,25 @@ def main():
         "  q_l =", args.q_l,
         "  gate_q_mode =", args.gate_q_mode,
         "  theta_confirm =", args.theta_confirm,
+        "  theta_reject =", args.theta_reject,
+        "  t_timeout =", args.t_timeout,
+        "  kappa_pos =", args.kappa_pos,
+        "  kappa_neg =", args.kappa_neg,
+        "  k_atk =", args.k_atk,
+        "  pool_k =", args.pool_k,
+        "  v_min =", args.v_min,
+        "  beta_v =", args.beta_v,
+        "  gamma_r =", args.gamma_r,
+        "  tau =", args.tau,
         "  buf_q_mode =", args.buf_q_mode,
+        "  bev_matcher =", args.bev_matcher or "off",
+        "  bev_tau =", args.bev_tau,
+        "  bev_c_min =", args.bev_c_min,
         "  mode =", args.mode,
         "  level =", args.level,
         "  n_objects =", args.n_objects,
         "  early_remove_mode =", args.early_remove_mode,
+        "  remove_select =", args.remove_select,
         "  defense =", args.defense,
     )
     if args.verbose:
@@ -863,10 +1063,14 @@ def main():
             n_objects=args.n_objects,
             verbose=args.verbose,
             early_remove_mode=args.early_remove_mode,
+            remove_select=args.remove_select,
         )
         if defer_late:
             cuda_empty_cache("after {} attack".format(args.level))
-            ensure_late_perceptions(detector, args.ego_ckpt, args.uav_ckpt)
+            ensure_late_perceptions(
+                detector, args.ego_ckpt, args.uav_ckpt,
+                score_threshold=args.det_score_thres,
+            )
         frames = detector.run_case(work_case, frame_ids)
         if init_override is not None:
             replace_init_with_attack(frames, init_override, detector, work_case)
@@ -1094,6 +1298,11 @@ def main():
             "scenes": {n: rec["cases"] for n, rec in scenes.items()},
             "score_thres": args.score_thres,
             "theta_p": args.theta_p,
+            "theta_soft": args.theta_soft,
+            "bev_matcher": args.bev_matcher,
+            "bev_tau": args.bev_tau,
+            "bev_c_min": args.bev_c_min,
+            "det_score_thres": args.det_score_thres,
             "n_ref": args.n_ref,
             "n_ref_uav": args.n_ref_uav,
             "r0": args.r0,
@@ -1105,10 +1314,22 @@ def main():
             "q_l": args.q_l,
             "gate_q_mode": args.gate_q_mode,
             "theta_confirm": args.theta_confirm,
+            "theta_reject": args.theta_reject,
+            "t_timeout": args.t_timeout,
+            "kappa_pos": args.kappa_pos,
+            "kappa_neg": args.kappa_neg,
+            "k_atk": args.k_atk,
+            "pool_k": args.pool_k,
+            "v_min": args.v_min,
+            "beta_v": args.beta_v,
+            "gamma_r": args.gamma_r,
+            "tau": args.tau,
             "buf_q_mode": args.buf_q_mode,
             "mode": args.mode,
             "level": args.level,
             "n_objects": args.n_objects,
+            "early_remove_mode": args.early_remove_mode,
+            "remove_select": args.remove_select,
             "defense": args.defense,
             "defense_metrics": evaluate_defense(all_frames),
             "accepted_metrics": evaluate_accepted(all_frames),

@@ -1,25 +1,19 @@
 """Tentative buffer: init, Bayesian update, confirm / reject / timeout (scheme §7).
 
-No global W_trust. P0 uses the timeout midpoint 0.5 as a prior (scheme §7.2).
+P0 (always-weighted, missing side = 0):
+  a_e = P_e/(P_e+θ_P) or 0,  a_c = P_c/(P_c+θ_P) or 0
+  f_V = 1 + β(0.5−V),  f_r = 1 + γ(r−r0)/(r+r0)
+  P0 = clip((f_V a_e + f_r a_c)/(f_V+f_r), P_min+ε, P_max−ε)
+
 Spatial evidence is Ego-only:
   hit  → +κ_pos · ψ(Q_buf) · w(v),  w(v)=1+σ((0.5−v)/τ)
   miss → −κ_neg · v
-where Q_buf = P·C_abs (not P·C). Full C = C_abs·V is for gating Q=P·C;
-buffer keeps geometric v in w(v)/e_- so V is not multiplied twice into ψ.
+ψ uses θ_P (not θ_soft). Default Q_buf = P.
 
-Hard P≥score_thres still gates Certain/pool. Buffer may also match soft Ego
-(θ_soft ≤ P < score_thres) to existing watches; soft Ego never births a watch
-and never enters Certain. UAV/Init never add positive evidence.
+Soft Ego (θ_soft ≤ P < θ_P) can update existing watches; Ambiguous now also
+births. UAV/Init never add positive evidence.
 
-New watches are leftover-only (scheme §4.3.0). If an existing watch matches a
-gate/pool Certain this frame, drop it silently (not buffer confirm); hist is kept
-for dump backfill only.
-
-Each watch has a KF. Unmatched + ray-visible → ATTACK (label only; do not
-emit into Ŷ — Tentative is still uncertain). Pool ATTACK still coasts.
-
-Visibility `v` defaults to box-ray occluders; pass `visibility_fn(box)->float`
-(e.g. LiDAR polar depth from ego) to override.
+If an existing watch matches a gate/pool Certain this frame, drop it silently.
 """
 from __future__ import annotations
 
@@ -29,13 +23,17 @@ from typing import Any, Callable, List, Optional
 import numpy as np
 
 from .associate import THETA_DIST, THETA_IOU, hungarian_match_pool, same_object
-from .gating import CERTAIN, Q_L, TENTATIVE, detection_quality, traj_ref_box
+from .gating import CERTAIN, Q_L, TENTATIVE, THETA_P, THETA_SOFT, detection_quality, traj_ref_box
 from .geometry import iou_bev
 from .kf import birth_state, kf_predict, kf_update
 from .occlusion import K_ATK, V_MIN, visibility_ratio
+from .confidence import R0_EGO
 
 P_MIN = 0.15
-THETA_SOFT = 0.05  # buffer-only Ego band; gating/pool still use score_thres
+P_MAX = 1.0
+P_EPS = 0.02
+BETA_V = 0.5
+GAMMA_R = 0.5
 THETA_CONFIRM = 0.7
 THETA_REJECT = 0.1
 T_TIMEOUT = 10
@@ -61,16 +59,13 @@ def sigmoid(x: float) -> float:
     return float(1.0 / (1.0 + np.exp(-z)))
 
 
-def phi_ego(q_ego: float, q_ref: float = Q_L, tau: float = TAU) -> float:
-    """φ(Q_ego) = σ((Q_l - Q_ego) / τ)."""
+def phi_ego(q_ego: float, q_ref: float = THETA_P, tau: float = TAU) -> float:
+    """φ(Q_ego) = σ((θ_P - Q_ego) / τ)."""
     return sigmoid((float(q_ref) - float(q_ego)) / float(tau))
 
 
-def psi_ego(q_ego: float, q_ref: float = Q_L, tau: float = TAU) -> float:
-    """ψ(Q) = 1 - φ(Q) = σ((Q - Q_l) / τ).
-
-    Buffer passes Q = P·C_abs (see obj_q_buf_ego). Do not feed P·C_abs·V here.
-    """
+def psi_ego(q_ego: float, q_ref: float = THETA_P, tau: float = TAU) -> float:
+    """ψ(Q) = 1 - φ(Q) = σ((Q - θ_P) / τ). Default Q = P."""
     return 1.0 - phi_ego(q_ego, q_ref=q_ref, tau=tau)
 
 
@@ -126,16 +121,61 @@ def obj_q_collab(obj) -> float:
     return obj_q_init(obj)
 
 
-def g_uav(q_collab: float, q_ego: float) -> float:
-    denom = float(q_ego) + float(q_collab)
-    ratio = 1.0 if denom <= 0 else float(q_collab) / denom
-    return ratio * phi_ego(q_ego)
+def a_sat(p: float, theta_p: float = THETA_P) -> float:
+    """a = P / (P + θ_P); missing / non-positive → 0."""
+    p = float(p)
+    tp = float(theta_p)
+    if p <= 0.0 or tp <= 0.0:
+        return 0.0
+    return p / (p + tp)
 
 
-def strength(q: float, q_ref: float = Q_L, p_min: float = P_MIN) -> float:
-    if q_ref <= 0:
-        return float(p_min)
-    return float(np.clip(float(q) / float(q_ref), p_min, 1.0))
+def f_vis(v: float, beta: float = BETA_V) -> float:
+    return 1.0 + float(beta) * (0.5 - float(np.clip(v, 0.0, 1.0)))
+
+
+def f_range(r: float, r0: float = R0_EGO, gamma: float = GAMMA_R) -> float:
+    r = float(max(r, 0.0))
+    r0 = float(r0)
+    return 1.0 + float(gamma) * (r - r0) / (r + r0 + 1e-9)
+
+
+def birth_p0(
+    p_ego: float,
+    p_collab: float,
+    v: float,
+    r: float,
+    theta_p: float = THETA_P,
+    r0: float = R0_EGO,
+    p_min: float = P_MIN,
+    p_max: float = P_MAX,
+    eps: float = P_EPS,
+    beta: float = BETA_V,
+    gamma: float = GAMMA_R,
+) -> float:
+    """Always-weighted P0; missing source contributes 0.
+
+    a = (f_V a_e + f_r a_c) / (f_V + f_r)
+    clipped to [P_min+ε, P_max−ε].
+    """
+    ae = a_sat(p_ego, theta_p)
+    ac = a_sat(p_collab, theta_p)
+    fv = f_vis(v, beta=beta)
+    fr = f_range(r, r0=r0, gamma=gamma)
+    a = (fv * ae + fr * ac) / (fv + fr)
+    lo = float(p_min) + float(eps)
+    hi = float(p_max) - float(eps)
+    return _clip01(a, lo=lo, hi=hi)
+
+
+def collab_score(obj) -> float:
+    """Max detector P among UAV / Init that matched this object."""
+    scores = []
+    if int(getattr(obj, "d_uav", 0)):
+        scores.append(float(getattr(obj, "p_uav", 0.0) or 0.0))
+    if int(getattr(obj, "d_init", 0)):
+        scores.append(float(getattr(obj, "p_init", 0.0) or 0.0))
+    return max(scores) if scores else 0.0
 
 
 def logit(p: float) -> float:
@@ -161,15 +201,13 @@ def spatial_evidence(
     v: float = 1.0,
     kappa_pos: float = KAPPA_POS,
     kappa_neg: float = KAPPA_NEG,
+    q_ref: float = THETA_P,
+    tau: float = TAU,
 ) -> float:
-    """Spatial log-odds increment (Ego-only).
-
-    Ego hit (hard or soft): +κ_pos · ψ(Q) · w(v),  Q = P·C_abs.
-    Ego miss (unmatched, or matched UAV/Init only): −κ_neg · v.
-    """
+    """Spatial log-odds increment (Ego-only). ψ reference is θ_P."""
     vv = float(np.clip(v, 0.0, 1.0))
     if ego_hit:
-        return float(kappa_pos) * psi_ego(q_ego) * occ_boost(vv)
+        return float(kappa_pos) * psi_ego(q_ego, q_ref=q_ref, tau=tau) * occ_boost(vv, tau=tau)
     return -float(kappa_neg) * vv
 
 
@@ -416,7 +454,12 @@ class TentativeBuffer:
         p_min: float = P_MIN,
         k_atk: int = K_ATK,
         v_min: float = V_MIN,
-        buf_q_mode: str = "pc_abs",
+        buf_q_mode: str = "p",
+        theta_p: float = THETA_P,
+        r0: float = R0_EGO,
+        beta_v: float = BETA_V,
+        gamma_r: float = GAMMA_R,
+        tau: float = TAU,
     ):
         self.q_l = float(q_l)
         self.theta_iou = float(theta_iou)
@@ -429,7 +472,12 @@ class TentativeBuffer:
         self.p_min = float(p_min)
         self.k_atk = int(k_atk)
         self.v_min = float(v_min)
-        self.buf_q_mode = str(buf_q_mode or "pc_abs")
+        self.buf_q_mode = str(buf_q_mode or "p")
+        self.theta_p = float(theta_p)
+        self.r0 = float(r0)
+        self.beta_v = float(beta_v)
+        self.gamma_r = float(gamma_r)
+        self.tau = float(tau)
         self.reset()
 
     def reset(self) -> None:
@@ -441,29 +489,36 @@ class TentativeBuffer:
         self.last_confirm_trajs: list = []
 
     def _init_from_obj(
-        self, obj, frame_id: int = 0, ego=None, uav=None, init=None
+        self, obj, frame_id: int = 0, ego=None, uav=None, init=None, v: float = 1.0
     ) -> BufferEntry:
-        st = strength(source_q(obj), q_ref=self.q_l, p_min=self.p_min)
+        pe = float(getattr(obj, "p_ego", 0.0) or 0.0) if int(getattr(obj, "d_ego", 0)) else 0.0
+        pc = collab_score(obj)
         q_ego = obj_q_buf_ego(obj, mode=self.buf_q_mode)
-        q_collab = obj_q_collab(obj)
-        # 0.5 is the same pivot as timeout (P <= 0.5), not a new threshold.
-        half = 0.5
-        if obj.from_ambiguous:
-            gamma = q_ego / self.q_l if self.q_l > 0 else 1.0
-            p0 = max(half * st * gamma, self.p_min)
-        else:
-            p0 = max(half * g_uav(q_collab, q_ego) * st, self.p_min)
         ref, src = traj_ref_box(obj, ego=ego, uav=uav, init=init)
         b = (
             np.asarray(ref, dtype=np.float64)[:7].copy()
             if ref is not None
             else np.asarray(obj.box, dtype=np.float64)[:7].copy()
         )
+        r = float(np.hypot(b[0], b[1]))
+        p0 = birth_p0(
+            pe,
+            pc,
+            v=v,
+            r=r,
+            theta_p=self.theta_p,
+            r0=self.r0,
+            p_min=self.p_min,
+            p_max=P_MAX,
+            eps=P_EPS,
+            beta=self.beta_v,
+            gamma=self.gamma_r,
+        )
         traj = [(int(frame_id), b.copy(), src or "box")]
         x, P = birth_state(b, traj=[(int(frame_id), b.copy())])
         return BufferEntry(
             box=b,
-            p=_clip01(p0),
+            p=_clip01(p0, lo=self.p_min + P_EPS, hi=P_MAX - P_EPS),
             age=1,
             d_uav0=int(obj.d_uav),
             from_ambiguous=bool(obj.from_ambiguous),
@@ -491,6 +546,8 @@ class TentativeBuffer:
             v=v,
             kappa_pos=self.kappa_pos,
             kappa_neg=self.kappa_neg,
+            q_ref=self.theta_p,
+            tau=self.tau,
         )
         if curr_box is not None:
             curr = np.asarray(curr_box, dtype=np.float64).copy()
@@ -739,7 +796,7 @@ class TentativeBuffer:
             if id(obj) in used_ids or obj.state != TENTATIVE or obj.box is None:
                 continue
             entry = self._init_from_obj(
-                obj, frame_id=frame_id, ego=ego, uav=uav, init=init
+                obj, frame_id=frame_id, ego=ego, uav=uav, init=init, v=_vis(obj.box)
             )
             finish(entry, self._decide(entry))
 

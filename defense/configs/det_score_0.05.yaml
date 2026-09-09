@@ -1,0 +1,5 @@
+# OpenCOOD late PointPillar NMS floor. Apply with:
+#   python scripts/run_three_source.py --det_score_thres 0.05
+postprocess:
+  target_args:
+    score_threshold: 0.05

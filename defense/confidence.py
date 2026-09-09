@@ -22,8 +22,9 @@ from .geometry import count_points_in_box
 # §2.1.2  “typical vehicle, seen clearly”
 # Probe default for C=C_abs*V: ~25 m ego p10–p25 scale (see logs n@25m).
 # Old clear-pool median (~2029) crushed mid-range C_abs under V product.
-N_REF_EGO = 200.0
-N_REF_UAV = 200.0
+# Align with 9/5 / polar C calib (clear-box scale), not the 200-ray probe.
+N_REF_EGO = 40.0
+N_REF_UAV = 25.0
 # Legacy / optional C_n calibration (unused when use_cn=False)
 R_MIN = 4.0
 R0 = 10.60

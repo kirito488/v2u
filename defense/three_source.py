@@ -36,9 +36,22 @@ from .confidence import (
 from .geometry import blank_lidar, iou_bev, pack_dets
 from .gating import CERTAIN, Q_H, Q_L, THETA_P, force_certain_for_gt_id, gate_frame
 from .far_certain import FarCertainTracker, T_FAR, backfill_tentative_to_certain
-from .buffer import CONFIRM, SoftEgoDet, THETA_CONFIRM, THETA_SOFT, TentativeBuffer
-from .trust_pool import TrustPool
-from .occlusion import build_polar_depth, visibility_ratio_lidar
+from .buffer import (
+    BETA_V,
+    CONFIRM,
+    GAMMA_R,
+    KAPPA_NEG,
+    KAPPA_POS,
+    SoftEgoDet,
+    TAU,
+    THETA_CONFIRM,
+    THETA_REJECT,
+    THETA_SOFT,
+    T_TIMEOUT,
+    TentativeBuffer,
+)
+from .trust_pool import POOL_K, TrustPool
+from .occlusion import K_ATK, V_MIN, build_polar_depth, visibility_ratio_lidar
 from .paths import EGO_ID, UAV_ID
 from .attack_gt import is_car_oid
 from .uav_fov import box_in_uav_fov
@@ -629,9 +642,23 @@ class ThreeSourceDetector:
         q_l: float = Q_L,
         ego_perception=None,
         uav_perception=None,
-        gate_q_mode: str = "pc",
+        gate_q_mode: str = "p",
         theta_confirm: float = THETA_CONFIRM,
-        buf_q_mode: str = "pc_abs",
+        buf_q_mode: str = "p",
+        theta_soft: Optional[float] = None,
+        bev_matcher=None,
+        bev_tau: float = 0.5,
+        bev_c_min: float = 0.2,
+        theta_reject: float = THETA_REJECT,
+        t_timeout: int = T_TIMEOUT,
+        kappa_pos: float = KAPPA_POS,
+        kappa_neg: float = KAPPA_NEG,
+        k_atk: int = K_ATK,
+        pool_k: int = POOL_K,
+        v_min: float = V_MIN,
+        beta_v: float = BETA_V,
+        gamma_r: float = GAMMA_R,
+        tau: float = TAU,
     ):
         self.perception = perception
         self.ego_perception = ego_perception
@@ -650,15 +677,27 @@ class ThreeSourceDetector:
             self.theta_p = float(score_thres)
         else:
             self.theta_p = float(THETA_P)
+        self.theta_soft = float(Q_L if theta_soft is None else theta_soft)
         self.q_h = float(q_h)
         self.q_l = float(q_l)
-        self.gate_q_mode = str(gate_q_mode or "pc")
+        self.gate_q_mode = str(gate_q_mode or "p")
         self.theta_confirm = float(theta_confirm)
-        self.buf_q_mode = str(buf_q_mode or "pc_abs")
+        self.buf_q_mode = str(buf_q_mode or "p")
         self.tent_buffer = TentativeBuffer(
             q_l=self.q_l,
             theta_confirm=self.theta_confirm,
+            theta_reject=float(theta_reject),
+            t_timeout=int(t_timeout),
+            kappa_pos=float(kappa_pos),
+            kappa_neg=float(kappa_neg),
+            k_atk=int(k_atk),
+            v_min=float(v_min),
             buf_q_mode=self.buf_q_mode,
+            theta_p=self.theta_p,
+            r0=self.r0,
+            beta_v=float(beta_v),
+            gamma_r=float(gamma_r),
+            tau=float(tau),
         )
         self.far_tracker = FarCertainTracker()
         self.trust_pool = TrustPool(
@@ -667,7 +706,13 @@ class ThreeSourceDetector:
             n_ref_ego=self.n_ref,
             r0=self.r0,
             r_min=self.r_min,
+            k_max=int(pool_k),
+            k_atk=int(k_atk),
+            v_min=float(v_min),
         )
+        self.bev_matcher = bev_matcher
+        self.bev_tau = float(bev_tau)
+        self.bev_c_min = float(bev_c_min)
 
     def apply_defense(
         self,
@@ -702,7 +747,25 @@ class ThreeSourceDetector:
             q_h=self.q_h,
             q_l=self.q_l,
             gate_q_mode=self.gate_q_mode,
+            theta_soft=self.theta_soft,
         )
+        if self.bev_matcher is not None:
+            from .bev_matcher import last_bev_tensor, promote_uav_bev_certain
+
+            n_bev = promote_uav_bev_certain(
+                gating,
+                last_bev_tensor(self.ego_perception),
+                last_bev_tensor(self.uav_perception),
+                self.bev_matcher,
+                tau=self.bev_tau,
+                c_min=self.bev_c_min,
+            )
+            if n_bev:
+                print(
+                    "[bev] promoted {} UAV/Init box(es) → Certain (Ego↔UAV BEV)".format(
+                        n_bev
+                    )
+                )
         gating = force_certain_for_gt_id(gating, gt_eval, gt_eval_ids)
         gating = force_certain_for_gt_id(gating, gt_ego, gt_ego_ids)
         self.far_tracker.step(gating, frame_id=frame_id)
@@ -830,7 +893,7 @@ class ThreeSourceDetector:
             frame_id=frame_id,
             match_objects=list(gating.objects),
             soft_ego=_soft_ego_dets(
-                ego_raw, self.score_thres, buf_q_mode=self.buf_q_mode
+                ego_raw, self.theta_p, soft_thres=self.theta_soft, buf_q_mode=self.buf_q_mode
             ),
             visibility_fn=_ego_vis if ego_depth is not None else None,
             ego=ego,
@@ -923,16 +986,20 @@ class ThreeSourceDetector:
             )
         )
 
-        if self.score_thres is not None:
+        if self.score_thres is not None or self.theta_soft is not None:
             n_e, n_u, n_i = ego.n, uav.n, init.n
-            ego = ego.filter_by_score(self.score_thres)
-            uav = uav.filter_by_score(self.score_thres)
-            init = init.filter_by_score(self.score_thres)
+            ego_lo = self.theta_soft if self.theta_soft is not None else self.score_thres
+            collab_lo = self.score_thres if self.score_thres is not None else self.theta_p
+            if ego_lo is not None:
+                ego = ego.filter_by_score(ego_lo)
+            if collab_lo is not None:
+                uav = uav.filter_by_score(collab_lo)
+                init = init.filter_by_score(collab_lo)
             dropped = (n_e - ego.n) + (n_u - uav.n) + (n_i - init.n)
             if dropped:
                 print(
-                    "[filter] P<{} dropped ego {}→{} uav {}→{} init {}→{}".format(
-                        self.score_thres, n_e, ego.n, n_u, uav.n, n_i, init.n
+                    "[filter] ego P<{} {}→{} | uav/init P<{} {}→{} / {}→{}".format(
+                        ego_lo, n_e, ego.n, collab_lo, n_u, uav.n, n_i, init.n
                     )
                 )
 

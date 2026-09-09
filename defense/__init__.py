@@ -5,6 +5,7 @@ from .gating import (
     Q_H,
     Q_L,
     THETA_P,
+    THETA_SOFT,
     gate_frame,
     FrameGating,
     spatial_state,
@@ -13,11 +14,13 @@ from .gating import (
     detection_quality,
 )
 from .buffer import TentativeBuffer, FrameBuffer
+from .bev_matcher import BevLocalMatcher
 
 __all__ = [
     "ThreeSourceDetector",
     "FrameThreeSource",
     "THETA_P",
+    "THETA_SOFT",
     "Q_H",
     "Q_L",
     "gate_frame",
@@ -28,4 +31,5 @@ __all__ = [
     "detection_quality",
     "TentativeBuffer",
     "FrameBuffer",
+    "BevLocalMatcher",
 ]

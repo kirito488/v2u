@@ -59,8 +59,11 @@ class LidarSpoofIntermediateMultiAttacker(Attacker):
             donors = select_donor_boxes(multi_frame_case, attacker_id, self.rng, num_objects)
             K = min(num_objects, len(donors))
             if K == 0:
-                print("[multi-spoof] frame {}: no donor objects available, skipping".format(frame_id))
-                continue
+                # No donor geometry — still inject K default car-sized ghosts
+                # so every frame is attacked.
+                print("[multi-spoof] frame {}: no donors, use default size".format(frame_id))
+                K = int(num_objects)
+                donors = [(4.7, 1.9, 1.7, float(np.deg2rad(ego_case["lidar_pose"][4])))] * K
 
             # 2. Choose K dangerous / blind positions in the ego frame.
             if frame_id in positions_override and len(positions_override[frame_id]) >= K:
@@ -68,6 +71,13 @@ class LidarSpoofIntermediateMultiAttacker(Attacker):
             else:
                 positions, scores = select_attack_positions(
                     ego_case["lidar"], ego_case["gt_bboxes"], K, self.rng)
+            if not positions:
+                # Absolute fallback: ahead of ego
+                positions = [[20.0 + 3.0 * i, 0.0, -1.0] for i in range(K)]
+                print("[multi-spoof] frame {}: empty positions, use ahead grid".format(frame_id))
+            while len(positions) < K:
+                positions.append([20.0 + 3.0 * len(positions), 0.0, -1.0])
+            K = min(K, len(positions), len(donors))
 
             # 3. Assemble ego-frame bboxes: position from blind/danger spot,
             #    geometry (l,w,h) and orientation from the donor.

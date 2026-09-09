@@ -32,7 +32,7 @@ from mvp.data.util import pcd_sensor_to_map, pcd_map_to_sensor, pose_to_transfor
 class OpencoodPerception(Perception):
     def __init__(self, fusion_method="early", model_name="pointpillar",
                  model_dir=None, opencood_root=None,
-                 root_dir=None, validate_dir=None):
+                 root_dir=None, validate_dir=None, score_threshold=None):
         super().__init__()
         # pointpillar = AttFuse 模型；attfuse/where2comm/coalign 为 V2U4Real 的三个模型
         assert(model_name in ["pixor", "voxelnet", "second", "pointpillar", "v2vnet", "fpvrcnn",
@@ -68,6 +68,9 @@ class OpencoodPerception(Perception):
         }
 
         hypes = yaml_utils.load_yaml(self.config_file, None)
+        if score_threshold is not None:
+            hypes.setdefault("postprocess", {}).setdefault("target_args", {})
+            hypes["postprocess"]["target_args"]["score_threshold"] = float(score_threshold)
         # 数据路径：V2U4Real 时由外部传入
         if root_dir is not None:
             hypes["root_dir"] = root_dir
@@ -122,7 +125,7 @@ class OpencoodPerception(Perception):
             self.last_fusion_z = None
             return None
         out = {}
-        for key in ("Z_ego", "Z_fused"):
+        for key in ("Z_ego", "Z_fused", "spatial_features_2d"):
             t = z.get(key)
             if t is None:
                 continue

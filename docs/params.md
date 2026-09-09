@@ -17,9 +17,11 @@
 
 **Ablation budget (recommended):**
 
+→ **已定方案见 [`docs/ABLATION_PLAN.md`](ABLATION_PLAN.md)**（2026-09-08）
+
 1. Module leave-one-out (main table): `full` · `−buffer` · `−pool ATTACK` · `−pool` · `−polar-V`
-2. One scalar family (appendix): `θ_confirm ∈ {0.5, 0.7, 0.9}`
-3. Attacks for ablation: `spoof_intermediate` · `remove_intermediate` · `remove_early` (+ `clean` for side-effect)
+2. 五组超参消融（附录/主文）: 见 `ABLATION_PLAN.md`（\(V_{\min}=P5\) 只标定不扫；\(\theta_{\mathrm{soft}}\in\{0.1,0.15,0.2\}\)；\(\theta_{\mathrm{score}}=0.3\)；\(\theta_{\mathrm{confirm}}\in\{0.6,0.7,0.8\}\)）
+3. Attacks for ablation: `remove_early` 主打 (+ `clean`；其它攻击附录)
 
 ---
 
@@ -31,7 +33,7 @@
 | High quality scale | `MU_H` | 0.7 | **CAL** | Keep; `Q_h = θ_P · μ_h` must track `θ_P`. |
 | Low quality scale | `MU_L` | 0.5 | **CAL** | Same. With `θ_P=0.3` → `Q_h=0.21`, `Q_l=0.15` if formulas stay linked. |
 | Certain / tentative cut | `Q_H`, `Q_L` | **0.40 / 0.30** | **CAL** | 2026-09-07 clean 200f under \(C=C_{\mathrm{abs}}V\), \(n_{\mathrm{ref}}=200\). Old 0.35/0.25 (θ_P=0.5·μ) too Certain-heavy when \(C\approx1\); θ_P=0.3·μ=0.21/0.15 collapses Ambiguous. |
-| Soft-Ego lower band | `THETA_SOFT` | 0.05 | **LOCK** | Buffer-only band `[θ_soft, θ_P)`. |
+| Soft-Ego lower band | `THETA_SOFT` | **0.1**（主）；消融 `{0.1,0.15,0.2}` | **ABL** | 见 `ABLATION_PLAN.md`。旧跑曾用 0.05。 |
 | Force-certain debug id | `FORCE_CERTAIN_GT_ID` | `"1"` | **LOCK** | Debug / dump only. |
 
 ---
@@ -73,7 +75,7 @@
 | Neighbour bins | `POLAR_NB` | 1 | **LOCK** | Anti-discretization (OctoMap / WYSIWYG spirit). |
 | Range slack | `_HIT_EPS` | 0.3 m | **LOCK** | Calibration / motion slack. |
 | Bottom-center lift | `bottom_center` | True (ego path) | **LOCK** | OpenCOOD bottom-center boxes: \(z \leftarrow z+h/2\) before sampling. |
-| Visible iff | `V_MIN` | 0.25 | **LOCK** | ≥ **2/8** corners free. Module on/off is ablated via `−polar-V` (\(V\equiv1\)), not by sweeping \(V_{\min}\). |
+| Visible iff | `V_MIN` | **= UAV \(S_{\mathrm{uav}}\) 的 P5** | **CAL** | clean 上 UAV 检出目标可见性 5% 分位，**标定一次后锁死、不扫**。旧默认 0.25（≈2/8）仅作历史对照。 |
 
 ---
 

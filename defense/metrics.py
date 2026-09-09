@@ -301,6 +301,7 @@ ACCEPTED_STATES = frozenset({
     "attack",
     "ambiguous -> certain",
     "tentative -> certain",
+    "bev -> certain",
 })
 
 
@@ -339,7 +340,7 @@ def _overlay_pool_on_gate_maps(gate_maps: dict, pool) -> dict:
                 cur = str(dest.get(int(i), "") or "")
                 if cur.startswith("ambiguous -> certain") or cur.startswith(
                     "tentative -> certain"
-                ):
+                ) or cur.startswith("bev -> certain"):
                     continue
                 dest[int(i)] = "certain"
             elif lab == "pool":
@@ -659,7 +660,7 @@ def print_attack_miss(
         print("miss = any remove target still absent (object not recovered)")
         print("ASR = frame-level remove success (target absent)")
         print("ORR = instance-level absent rate among all remove targets")
-    print("  with-defense = accepted (certain/pool/attack/am→certain/tentative→certain; + pool coast)")
+        print("  with-defense = accepted (certain/pool/attack/am→certain/tentative→certain/bev→certain; + pool coast)")
     print("  no-defense (Init):  miss={:>4d}/{:<4d}  ASR={:.1%}  caught={:>4d}".format(
         st["miss_no_defense"], n, st["asr_no_defense"],
         st["caught_no_defense"]))

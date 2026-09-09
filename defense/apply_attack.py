@@ -185,8 +185,13 @@ def _pick_mass_targets(
     iou_thres: float = 0.3,
     max_dist: float = 4.0,
     min_range: float = 8.0,
+    ensure_one: bool = True,
 ) -> List[np.ndarray]:
-    """Top-K clean fusion boxes that match GT (skip Init FPs / near-ego)."""
+    """Top-K clean fusion boxes that match GT.
+
+    ensure_one: if no GT-matched dets, fall back to top-K fused dets in range
+    (still skip empty frames only when clean has nothing).
+    """
     if clean_dets is None:
         return []
     boxes, scores = clean_dets
@@ -204,6 +209,18 @@ def _pick_mass_targets(
         if not _det_matches_gt(b, gt_boxes, iou_thres=iou_thres, max_dist=max_dist):
             continue
         keep.append(i)
+    if not keep and ensure_one:
+        # Fallback: any in-range fused det (may include FP; still attacks something).
+        for i in range(len(scores)):
+            if float(scores[i]) < float(min_score):
+                continue
+            b = boxes[i][:7]
+            if float(np.hypot(b[0], b[1])) < float(min_range):
+                continue
+            keep.append(i)
+        if not keep:
+            # Absolute last resort: highest-score box regardless of range/score floor
+            keep = [int(np.argmax(scores))]
     keep = sorted(keep, key=lambda i: -float(scores[i]))[: max(1, int(k))]
     return [boxes[i][:7].copy() for i in keep]
 
@@ -211,7 +228,11 @@ def _pick_mass_targets(
 def _run_mass_remove(
     perception, multi_frame_case, frame_ids, ego_id, att_id, iters, n_objects, clean
 ):
-    """Suppress K clean detections jointly via intermediate remove PGD."""
+    """Suppress K clean detections jointly via intermediate remove PGD.
+
+    Every frame gets ≥1 target when possible (GT-matched preferred; else fused;
+    else nearest Car GT).
+    """
     from .three_source import build_v2u4_eval_gt
     from .paths import UAV_ID as _UAV
 
@@ -219,24 +240,34 @@ def _run_mass_remove(
     print("[attack] mass_remove intermediate K={} iters={}".format(K, iters), flush=True)
     attacked = []
     targets: List[FrameTarget] = []
-    n_skip_fp = 0
+    n_fallback = 0
+    n_skip = 0
     for fi, f in enumerate(frame_ids):
         frame = multi_frame_case[f]
         gt_boxes, _ = build_v2u4_eval_gt(frame, ego_id, att_id or _UAV)
         raw = clean[fi] if fi < len(clean) else None
-        if raw is not None:
+        tgts = _pick_mass_targets(raw, K, gt_boxes=gt_boxes, ensure_one=True)
+        if not tgts and gt_boxes is not None and len(gt_boxes) > 0:
+            # No fused dets at all — attack nearest GT car(s)
+            gts = np.asarray(gt_boxes, dtype=np.float64)
+            order = np.argsort(np.hypot(gts[:, 0], gts[:, 1]))
+            tgts = [gts[i][:7].copy() for i in order[:K]]
+            n_fallback += 1
+        elif raw is not None:
             boxes, scores = raw
             boxes = np.asarray(boxes) if boxes is not None else np.zeros((0, 7))
             n_raw = int(boxes.shape[0]) if boxes.ndim == 2 else 0
-        else:
-            n_raw = 0
-        tgts = _pick_mass_targets(raw, K, gt_boxes=gt_boxes)
-        if n_raw > 0 and not tgts:
-            n_skip_fp += 1
+            if n_raw > 0 and tgts:
+                # Count whether we had to drop GT filter (approx: any tgt fails GT match)
+                if not any(
+                    _det_matches_gt(t, gt_boxes) for t in tgts
+                ):
+                    n_fallback += 1
         if not tgts:
             pb, ps = perception.run(frame, ego_id)
             attacked.append(_pack_dets(pb, ps))
             targets.append(None)
+            n_skip += 1
             continue
         result = perception.attack_intermediate(
             frame,
@@ -253,8 +284,8 @@ def _run_mass_remove(
         _cuda_empty_cache()
     n_ok = sum(1 for t in targets if t)
     print(
-        "[attack] mass_remove frames with targets={}/{} (skipped no-GT/near-ego={})".format(
-            n_ok, len(frame_ids), n_skip_fp
+        "[attack] mass_remove frames with targets={}/{} (fallback={} skip={})".format(
+            n_ok, len(frame_ids), n_fallback, n_skip
         ),
         flush=True,
     )
@@ -277,6 +308,7 @@ def apply_attack(
     n_objects: int = 3,
     verbose: bool = False,
     early_remove_mode: str = "box",
+    remove_select: str = "ensure",
 ) -> Tuple[Dict[int, Any], List[FrameTarget], Optional[List]]:
     """Return (case_for_three_source, per-frame targets, init_override).
 
@@ -287,12 +319,17 @@ def apply_attack(
     Levels: early | intermediate | late
       - multi_spoof / mass_remove: intermediate only
       - late: spoof / remove only (naive late fusion)
+
+    remove_select (early remove target policy):
+      - ensure: ≥1 target every frame (UAV-over-ego first, then fallback)
+      - prefer: any fused det with UAV pts≥15; no ego-score cap; may skip
     """
     if mode in (None, "none", ""):
         return multi_frame_case, [None] * len(frame_ids), None
 
     mode = str(mode)
     level = str(level or "early")
+    remove_select = str(remove_select or "ensure").lower()
     if mode in ("multi_spoof", "mass_remove") and level != "intermediate":
         print(
             "[attack] {!r} forces level=intermediate (was {!r})".format(mode, level),
@@ -306,9 +343,11 @@ def apply_attack(
     atk.VERBOSE = bool(verbose)
 
     print(
-        "[attack] clean baseline for target selection (mode={} level={} n_objects={} early_remove={}) ...".format(
+        "[attack] clean baseline for target selection "
+        "(mode={} level={} n_objects={} early_remove={} remove_select={}) ...".format(
             mode, level, n_objects,
             early_remove_mode if (mode == "remove" and level == "early") else "-",
+            remove_select if (mode == "remove" and level == "early") else "-",
         ),
         flush=True,
     )
@@ -364,6 +403,7 @@ def apply_attack(
                 also_ego=also_ego,
                 clean=clean,
                 remove_mode=early_remove_mode,
+                remove_select=remove_select,
             )
             if attacked is None:
                 print("[attack] no remove target, keep clean case", flush=True)
@@ -462,6 +502,7 @@ def apply_attack_by_case_spans(
     n_objects: int = 3,
     verbose: bool = False,
     early_remove_mode: str = "box",
+    remove_select: str = "ensure",
 ):
     """Apply attack per 10-frame case span, then keep one stitched case.
 
@@ -475,6 +516,7 @@ def apply_attack_by_case_spans(
             ego_id=ego_id, att_id=att_id, iters=iters, also_ego=also_ego,
             ghost=ghost, dense=dense, n_objects=n_objects, verbose=verbose,
             early_remove_mode=early_remove_mode,
+            remove_select=remove_select,
         )
 
     keep = set(int(f) for f in frame_ids)
@@ -511,6 +553,7 @@ def apply_attack_by_case_spans(
             n_objects=n_objects,
             verbose=verbose,
             early_remove_mode=early_remove_mode,
+            remove_select=remove_select,
         )
         if sub_out is not None:
             _write_case_frames(work, chunk, sub_out)

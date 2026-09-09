@@ -49,6 +49,9 @@ class PointPillar(nn.Module):
         rm = self.reg_head(spatial_features_2d)
 
         output_dict = {'psm': psm,
-                       'rm': rm}
+                       'rm': rm,
+                       'spatial_features_2d': spatial_features_2d}
+        # Defense / BEV matcher: keep a detached copy on the module.
+        self._defense_z = {'spatial_features_2d': spatial_features_2d.detach()}
 
         return output_dict

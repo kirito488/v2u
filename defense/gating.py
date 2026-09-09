@@ -1,17 +1,14 @@
 """Spatial gating Certain / Ambiguous / Tentative (scheme §5.1 + §6.3).
 
-Only leftover detections that did not match the trust pool (scheme §4.3.0).
+Default gate is P-only (gate_q_mode='p'):
+  Certain    : D_ego=1 and P_e ≥ θ_P (0.3)
+  Ambiguous  : D_ego=1 and θ_soft ≤ P_e < θ_P
+  Tentative  : leftover (no Ego) or below Dual resolve
 
-Gate Q_ego = P_ego * C_ego  (C = C_abs * V)
-Buffer ψ uses Q_buf = P * C_abs (see defense.buffer).
+Ego enters association at θ_soft (0.05). UAV/Init D=1 still requires P ≥ θ_P.
+C / V do not enter the state split; Dual can lift Ambiguous → Certain.
 
-Q_h / Q_l recalibrated 2026-09-07 on clean probe (C=C_abs·V, n_ref=200,
-score_thres=0.3, 200 frames): ego Q≈P (C often ~1). Old θ_P·μ with θ_P=0.5
-gave 0.35/0.25; linking θ_P=0.3→0.21/0.15 collapses Ambiguous. New defaults
-keep a usable Certain / Ambiguous / Tentative mass (~61% / 25% / 14%).
-
-D_src = 1 iff that source has P >= theta_P and Hungarian-matches this object.
-
+D_src = 1 iff that source has P ≥ its enter threshold and Hungarian-matches.
 §6.3: Ambiguous → Certain iff Dual=(D_uav=1 and D_init=1), else Tentative.
 """
 from __future__ import annotations
@@ -24,13 +21,14 @@ import numpy as np
 from .associate import THETA_IOU, hungarian_match
 from .geometry import iou_bev
 
-THETA_P = 0.5  # scheme default; batch runs usually override via score_thres=0.3
+THETA_P = 0.3  # UAV/Init D=1 and Certain cut on P
+THETA_SOFT = 0.05  # Ego enter / Ambiguous lower bound
 # Legacy μ (documentation / optional linkage); gate cuts are explicit below.
 MU_H = 0.7
 MU_L = 0.5
-# CAL 2026-09-07: clean 200f Q=P·C percentiles under C=C_abs·V, n_ref=200
-Q_H = 0.40
-Q_L = 0.30
+# P-only: Certain P≥Q_H, Ambiguous Q_L ≤ P < Q_H. Detector NMS floor may be 0.2/0.1/0.05.
+Q_H = THETA_P
+Q_L = THETA_SOFT
 
 CERTAIN = "certain"
 AMBIGUOUS = "ambiguous"
@@ -46,7 +44,7 @@ def detection_quality(p, c) -> float:
 
 
 def spatial_state(d_ego: int, q_ego: float, q_h: float = Q_H, q_l: float = Q_L) -> str:
-    """§5.1 hard gate. Ambiguous is resolved by resolve_ambiguous (§6.3)."""
+    """§5.1 P-only gate. Ambiguous is resolved by resolve_ambiguous (§6.3)."""
     if int(d_ego) == 1 and q_ego >= q_h:
         return CERTAIN
     if int(d_ego) == 1 and q_l <= q_ego < q_h:
@@ -174,6 +172,8 @@ class GatedObject:
     iou_init: float = 0.0
     dual: int = 0  # §6.2 Dual = D_uav AND D_init
     from_ambiguous: bool = False  # §6.3 transferred from Ambiguous
+    from_bev: bool = False  # local BEV matcher promoted to Certain
+    bev_s: float = 0.0  # matcher score S∈[0,1]
     from_far: bool = False  # far-range bypass Certain (not pooled)
     backfill_certain: bool = False  # dump-only: later confirmed
     show_certain: bool = False  # dump-only: confirm frame
@@ -188,6 +188,8 @@ class GatedObject:
         """Dump label: spatial state, Dual transfer, far/buffer confirm backfill."""
         if self.backfill_certain:
             return "tentative -> certain"
+        if self.from_bev and self.state == CERTAIN:
+            return "bev -> certain"
         if self.show_certain or (self.from_far and self.state == CERTAIN):
             return CERTAIN
         if self.from_ambiguous and self.state in (CERTAIN, TENTATIVE):
@@ -298,6 +300,8 @@ class FrameGating:
                     "state": o.state,
                     "display_state": o.display_state,
                     "from_ambiguous": bool(o.from_ambiguous),
+                    "from_bev": bool(getattr(o, "from_bev", False)),
+                    "bev_s": float(getattr(o, "bev_s", 0.0) or 0.0),
                     "from_far": bool(getattr(o, "from_far", False)),
                     "backfill_certain": bool(getattr(o, "backfill_certain", False)),
                     "d_ego": o.d_ego,
@@ -362,17 +366,19 @@ def gate_frame(
     exclude_ego=None,
     exclude_uav=None,
     exclude_init=None,
-    gate_q_mode: str = "pc",
+    gate_q_mode: str = "p",
+    theta_soft: Optional[float] = None,
 ) -> FrameGating:
     """Associate three sources, apply §5.1 spatial gating, then §6.3.
 
-    Ego-anchored objects: D_ego=1; state from Q_ego, then Ambiguous
-    is resolved by Dual=(D_uav=1 and D_init=1) → Certain, else Tentative.
-    UAV/Init leftovers (no Ego match): D_ego=0 → Tentative.
+    Ego-anchored objects: D_ego=1 at P≥θ_soft; state from Q_ego (default Q=P),
+    then Ambiguous is resolved by Dual=(D_uav=1 and D_init=1) → Certain,
+    else Tentative. UAV/Init leftovers (no Ego match): D_ego=0 → Tentative.
 
     Pool-matched detections (scheme §4.3.0) are excluded via exclude_*.
     """
-    ei = _keep_detected(ego, theta_p, exclude=exclude_ego)
+    ego_enter = float(q_l if theta_soft is None else theta_soft)
+    ei = _keep_detected(ego, ego_enter, exclude=exclude_ego)
     ui = _keep_detected(uav, theta_p, exclude=exclude_uav)
     ii = _keep_detected(init, theta_p, exclude=exclude_init)
 
